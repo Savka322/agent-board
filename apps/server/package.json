@@ -1,0 +1,13 @@
+{
+  "name": "@agent-board/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@agent-board/contracts": "workspace:*",
+    "@agent-board/core": "workspace:*",
+    "hono": "^4.13.12"
+  }
+}

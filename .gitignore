@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.db
+*.db-*
+.env
+.env.*
+secrets.toml
+# working plans stay local
+PLAN.md
+tasks/
+reports/

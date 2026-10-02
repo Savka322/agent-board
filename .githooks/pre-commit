@@ -1,0 +1,8 @@
+#!/bin/sh
+# Secret scan on staged changes. The repo is public: nothing secret may ever land in history.
+GITLEAKS="${GITLEAKS:-gitleaks}"
+if ! command -v "$GITLEAKS" >/dev/null 2>&1; then
+  echo "pre-commit: gitleaks not found (set GITLEAKS or add it to PATH)" >&2
+  exit 1
+fi
+exec "$GITLEAKS" git --pre-commit --staged --redact --no-banner
