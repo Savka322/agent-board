@@ -5,6 +5,9 @@
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
+  "scripts": {
+    "gen": "bun src/gen-report-schema.ts"
+  },
   "dependencies": {
     "zod": "^4.6.5"
   }

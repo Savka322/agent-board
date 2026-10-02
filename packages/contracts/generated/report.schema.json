@@ -1,0 +1,127 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "DONE",
+        "PARTIAL",
+        "BLOCKED"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
+    "files_changed": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "tests_run": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "cmd": {
+            "type": "string"
+          },
+          "result": {
+            "type": "string",
+            "enum": [
+              "pass",
+              "fail",
+              "error",
+              "skipped"
+            ]
+          },
+          "passed": {
+            "type": "integer"
+          },
+          "failed": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cmd",
+          "result",
+          "passed",
+          "failed"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "decision_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "decision_key",
+          "text"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "question": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "decision_key": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "options": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "recommendation": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "decision_key",
+            "text",
+            "options",
+            "recommendation"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "notes": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "status",
+    "summary",
+    "files_changed",
+    "tests_run",
+    "assumptions",
+    "question",
+    "notes"
+  ],
+  "additionalProperties": false
+}
