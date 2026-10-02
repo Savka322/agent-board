@@ -4,6 +4,7 @@
   "type": "module",
   "workspaces": ["apps/*", "packages/*"],
   "scripts": {
+    "agentctl": "bun apps/cli/src/index.ts",
     "test": "bun test",
     "typecheck": "tsc -b"
   },

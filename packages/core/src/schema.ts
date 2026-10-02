@@ -36,6 +36,15 @@ export const tasks = sqliteTable("tasks", {
   updatedAt: text("updated_at").notNull(),
 });
 
+export const taskLog = sqliteTable("task_log", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  task: text("task").notNull().references(() => tasks.id),
+  ts: text("ts").notNull(),
+  actor: text("actor").notNull(),
+  action: text("action").notNull(),
+  note: text("note"),
+});
+
 export const taskDeps = sqliteTable("task_deps", {
   task: text("task").notNull().references(() => tasks.id),
   dependsOn: text("depends_on").notNull().references(() => tasks.id),
@@ -125,6 +134,7 @@ export const schema = {
   projects,
   epics,
   tasks,
+  taskLog,
   taskDeps,
   taskDecisions,
   decisions,

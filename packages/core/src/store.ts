@@ -20,11 +20,11 @@ import {
   type TaskCard,
   type TaskStatus,
 } from "@agent-board/contracts";
-import { and, asc, eq, max, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, max, sql } from "drizzle-orm";
 import { drizzle, type BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import { migrate } from "drizzle-orm/bun-sqlite/migrator";
 import { mkdirSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { parseCardFile } from "./cards";
@@ -43,6 +43,7 @@ import {
   schema,
   taskDecisions,
   taskDeps,
+  taskLog,
   tasks,
 } from "./schema";
 
@@ -217,7 +218,8 @@ function taskFromRow(store: BoardStore, row: typeof tasks.$inferSelect): StoredT
 }
 
 export function addTask(store: BoardStore, epicId: string, cardPath: string): StoredTask {
-  const card = TaskCardSchema.parse(parseCardFile(readFileSync(cardPath, "utf8")));
+  const absoluteCardPath = resolve(cardPath);
+  const card = TaskCardSchema.parse(parseCardFile(readFileSync(absoluteCardPath, "utf8")));
   if (card.epic !== epicId) throw new TypeError("Task card epic must match the requested epic");
   const epic = getEpic(store, epicId);
   const timestamp = now();
@@ -228,7 +230,7 @@ export function addTask(store: BoardStore, epicId: string, cardPath: string): St
       title: card.title,
       status: "todo",
       prio: 0,
-      cardPath,
+      cardPath: absoluteCardPath,
       allowedFiles: jsonEncode(card.allowed_files),
       gates: jsonEncode(card.gates),
       lightTests: jsonEncode(card.light_tests),
@@ -262,6 +264,29 @@ export function listTasksByEpic(store: BoardStore, epicId: string): StoredTask[]
 export function listTasksByStatus(store: BoardStore, status: TaskStatus): StoredTask[] {
   const parsedStatus = TaskStatusSchema.parse(status);
   return store.db.select().from(tasks).where(eq(tasks.status, parsedStatus)).orderBy(asc(tasks.prio), asc(tasks.createdAt)).all().map((row) => taskFromRow(store, row));
+}
+
+export function listTasks(store: BoardStore) {
+  return store.db.select().from(tasks).orderBy(asc(tasks.prio), asc(tasks.createdAt)).all().map((row) => taskFromRow(store, row));
+}
+
+export function setTaskPriority(store: BoardStore, id: string, prio: number): StoredTask {
+  if (!Number.isInteger(prio)) throw new TypeError("Priority must be an integer");
+  getTask(store, id);
+  store.db.update(tasks).set({ prio, updatedAt: now() }).where(eq(tasks.id, id)).run();
+  return getTask(store, id);
+}
+
+export function listAnsweredDecisionsForTask(store: BoardStore, id: string) {
+  const task = getTask(store, id);
+  const project = getEpic(store, task.epic).project;
+  if (task.decisions.length === 0) return [];
+  return store.db.select().from(decisions)
+    .where(and(eq(decisions.project, project), inArray(decisions.key, task.decisions), eq(decisions.status, "answered")))
+    .orderBy(asc(decisions.key))
+    .all()
+    .filter((decision): decision is typeof decision & { answer: string } => decision.answer !== null)
+    .map(({ key, answer }) => ({ key, answer }));
 }
 
 export interface CreateDecisionInput {
@@ -368,6 +393,12 @@ export function answerQuestion(store: BoardStore, id: string, answer: string) {
   return questionFromRow({ ...current, status: "answered", answer, answeredAt });
 }
 
+export function getQuestion(store: BoardStore, id: string) {
+  const row = store.db.select().from(questions).where(eq(questions.id, id)).get();
+  if (!row) throw new StoreNotFoundError("Question", id);
+  return questionFromRow(row);
+}
+
 export function listOpenQuestionsForTask(store: BoardStore, taskId: string) {
   return store.db.select().from(questions).where(and(eq(questions.task, taskId), eq(questions.status, "open"))).orderBy(asc(questions.createdAt)).all().map(questionFromRow);
 }
@@ -413,6 +444,44 @@ export function createRun(store: BoardStore, input: CreateRunInput) {
   };
   store.db.insert(runs).values(row).run();
   return row;
+}
+
+export function listRunsForTask(store: BoardStore, taskId: string) {
+  return store.db.select().from(runs).where(eq(runs.task, taskId)).orderBy(asc(runs.round)).all().map((row) => ({
+    ...row,
+    outcome: row.outcome === null ? null : RunOutcomeSchema.parse(row.outcome),
+    usage: row.usage === null ? null : JSON.parse(row.usage) as unknown,
+  }));
+}
+
+export function getRunForRound(store: BoardStore, taskId: string, round: number) {
+  const row = store.db.select().from(runs).where(and(eq(runs.task, taskId), eq(runs.round, round))).get();
+  if (!row) throw new StoreNotFoundError("Run", `${taskId}/round-${round}`);
+  return getRun(store, row.id);
+}
+
+export interface TaskLogInput {
+  task: string;
+  actor: string;
+  action: string;
+  note?: string | null;
+}
+
+export function writeTaskLog(store: BoardStore, input: TaskLogInput) {
+  const row = {
+    task: input.task,
+    ts: now(),
+    actor: input.actor,
+    action: input.action,
+    note: input.note ?? null,
+  };
+  const inserted = store.db.insert(taskLog).values(row).returning().get();
+  if (!inserted) throw new Error("Task log insert returned no row");
+  return inserted;
+}
+
+export function listTaskLog(store: BoardStore, taskId: string) {
+  return store.db.select().from(taskLog).where(eq(taskLog.task, taskId)).orderBy(asc(taskLog.id)).all();
 }
 
 export function getRun(store: BoardStore, id: string) {
@@ -516,6 +585,24 @@ export function listEventsAfter(store: BoardStore, runId: string, cursor: number
     }));
 }
 
+export function listRecentEvents(store: BoardStore, runId: string, limit = 20): NormalizedEvent[] {
+  if (!Number.isInteger(limit) || limit < 1) throw new TypeError("Event limit must be a positive integer");
+  return store.db.select().from(events)
+    .where(eq(events.runId, runId))
+    .orderBy(desc(events.seq))
+    .limit(limit)
+    .all()
+    .reverse()
+    .map((row) => NormalizedEventSchema.parse({
+      run_id: row.runId,
+      seq: row.seq,
+      ts: row.ts,
+      kind: EventKindSchema.parse(row.kind),
+      text: row.text,
+      raw_line: row.rawLine,
+    }));
+}
+
 export interface CreateGateRunInput {
   id?: string;
   task: string;
@@ -604,7 +691,7 @@ export function listApprovals(store: BoardStore, epic: string) {
   return store.db.select().from(approvals).where(eq(approvals.epic, epic)).orderBy(asc(approvals.createdAt)).all();
 }
 
-export function transitionTask(store: BoardStore, id: string, action: TaskAction, actor: Actor, maxSlots = 5): StoredTask {
+export function transitionTask(store: BoardStore, id: string, action: TaskAction, actor: Actor, maxSlots = 5, note?: string): StoredTask {
   store.sqlite.exec("BEGIN IMMEDIATE");
   try {
     const task = getTask(store, id);
@@ -643,6 +730,7 @@ export function transitionTask(store: BoardStore, id: string, action: TaskAction
       prio = (lowest ?? 0) - 1;
     }
     store.db.update(tasks).set({ status: result.status, round: result.round, prio, updatedAt: now() }).where(eq(tasks.id, id)).run();
+    store.db.insert(taskLog).values({ task: id, ts: now(), actor, action, note: note ?? null }).run();
     store.sqlite.exec("COMMIT");
   } catch (error) {
     try { store.sqlite.exec("ROLLBACK"); } catch { /* Preserve the original error. */ }
