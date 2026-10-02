@@ -12,5 +12,8 @@
   },
   "devDependencies": {
     "drizzle-kit": "^0.31.11"
+  },
+  "scripts": {
+    "db:generate": "drizzle-kit generate --config=drizzle.config.ts"
   }
 }
