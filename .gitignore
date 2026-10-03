@@ -9,3 +9,4 @@ secrets.toml
 PLAN.md
 tasks/
 reports/
+*.tsbuildinfo
