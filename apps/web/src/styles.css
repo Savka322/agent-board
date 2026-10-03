@@ -123,7 +123,8 @@ button:focus-visible, select:focus-visible, a:focus-visible, summary:focus-visib
 .column-cards { display: flex; flex-direction: column; gap: 7px; }
 .column-empty { margin: 8px 2px; color: var(--muted); font-size: 10px; line-height: 1.4; }
 
-.task-card, .question-card { width: 100%; min-width: 0; padding: 9px; display: flex; flex-direction: column; align-items: stretch; gap: 7px; color: var(--ink); text-align: left; background: var(--surface-raised); border: 1px solid var(--line); border-radius: 7px; cursor: pointer; box-shadow: 0 1px 1px rgba(20, 35, 25, .025); transition: border-color 150ms ease, background-color 150ms ease, transform 150ms ease; }
+.task-card, .question-card { width: 100%; min-width: 0; padding: 9px; display: flex; flex-direction: column; align-items: stretch; gap: 7px; color: var(--ink); text-align: left; background: var(--surface-raised); border: 1px solid var(--line); border-radius: 7px; box-shadow: 0 1px 1px rgba(20, 35, 25, .025); transition: border-color 150ms ease, background-color 150ms ease, transform 150ms ease; }
+.task-card { cursor: pointer; }
 .task-card:hover, .question-card:hover { border-color: var(--line-strong); background: var(--surface); transform: translateY(-1px); }
 .task-card:active, .question-card:active { transform: translateY(0); }
 .task-card-top, .question-card-top { display: flex; align-items: center; justify-content: space-between; gap: 5px; }
@@ -139,7 +140,8 @@ button:focus-visible, select:focus-visible, a:focus-visible, summary:focus-visib
 .chip-stale, .chip-failed { color: var(--red); background: var(--red-pale); }
 .chip-start { color: var(--accent-dark); background: var(--accent-pale); }
 
-.question-card { gap: 7px; border-left: 2px solid var(--blue); }
+.question-card { gap: 7px; border-left: 2px solid var(--blue); cursor: default; }
+.question-highlighted { border-color: var(--blue); box-shadow: 0 0 0 2px color-mix(in srgb, var(--blue) 18%, transparent); }
 .question-code { color: var(--blue); font: 650 10px/1 "Cascadia Code", Consolas, monospace; }
 .question-marker { color: var(--muted); font-size: 9px; }
 .question-card-text { color: var(--ink); font-size: 10px; line-height: 1.35; overflow-wrap: anywhere; }
@@ -147,6 +149,28 @@ button:focus-visible, select:focus-visible, a:focus-visible, summary:focus-visib
 .question-options b { color: var(--muted); font-weight: 600; }
 .question-recommendation { color: var(--ink-soft); font-size: 9px; line-height: 1.35; overflow-wrap: anywhere; }
 .holds-tag { align-self: flex-start; padding: 3px 5px; color: var(--blue); background: var(--blue-pale); border-radius: 4px; font-size: 9px; }
+.answer-options { margin: 2px 0 0; padding: 7px; display: grid; gap: 6px; border: 1px solid var(--line); border-radius: 6px; }
+.answer-options legend { padding: 0 4px; color: var(--muted); font-size: 9px; }
+.answer-option { display: flex; align-items: center; gap: 6px; color: var(--ink-soft); font-size: 9px; cursor: pointer; }
+.answer-option input { margin: 0; accent-color: var(--accent); }
+.answer-option em { margin-left: auto; color: var(--accent-dark); font-size: 8px; font-style: normal; }
+.answer-input-label { display: grid; gap: 4px; color: var(--muted); font-size: 9px; }
+.answer-input-label textarea { width: 100%; min-height: 54px; resize: vertical; padding: 7px; color: var(--ink); background: var(--surface); border: 1px solid var(--line-strong); border-radius: 5px; font: inherit; font-size: 10px; }
+.answer-input-label textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.answer-error { margin: 0; }
+.answer-actions, .action-button-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.secondary-button, .danger-button { min-height: 30px; padding: 0 9px; border: 1px solid var(--line-strong); border-radius: 6px; font-size: 10px; cursor: pointer; }
+.secondary-button { color: var(--ink-soft); background: var(--surface); }
+.secondary-button:hover { background: var(--surface-muted); }
+.danger-button { color: var(--red); background: var(--red-pale); border-color: color-mix(in srgb, var(--red) 34%, var(--line)); }
+.danger-button:hover { border-color: var(--red); }
+button:disabled { opacity: .55; cursor: not-allowed; }
+.owner-actions { padding: 10px; background: var(--surface-muted); border-radius: 7px; }
+.owner-actions h4 { margin-bottom: 9px; }
+.owner-actions > .danger-button { margin-top: 8px; }
+.confirm-action p { margin: 7px 0; color: var(--ink-soft); font-size: 10px; }
+.approve-merge-button { justify-self: end; }
+.approved-note { justify-self: end; color: var(--accent-dark); font-size: 10px; }
 
 .app-footer { max-width: 1720px; margin: 0 auto; padding: 11px 28px 20px; display: flex; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 10px; }
 .loading-board { max-width: 1720px; margin: 25px auto; padding: 0 28px; }

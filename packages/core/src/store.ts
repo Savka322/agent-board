@@ -46,9 +46,11 @@ import {
   boardEvents,
   decisions,
   epics,
+  epicLog,
   events,
   gateRuns,
   gateStats,
+  notifications,
   projects,
   questions,
   runs,
@@ -77,6 +79,9 @@ const defaultSettings = {
   pause_backoff_minutes: 15,
   memory_limit_gb: 16,
   executor_memory_gb: 2,
+  web_port: 8790,
+  notify_app_id: "AgentBoard.Local",
+  notify_enabled: true,
 };
 
 export type BoardSettingKey = keyof typeof defaultSettings;
@@ -86,6 +91,7 @@ export interface BoardEvent {
   ts: string;
   kind: BoardEventKind;
   task: string | null;
+  epic: string | null;
   question: string | null;
   run: string | null;
   payload: unknown;
@@ -108,6 +114,13 @@ export class IllegalTaskTransitionError extends Error {
   constructor(readonly transition: Exclude<TransitionResult, { ok: true }>) {
     super(`Illegal task transition: ${transition.error.code}`);
     this.name = "IllegalTaskTransitionError";
+  }
+}
+
+export class RuleRefusalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RuleRefusalError";
   }
 }
 
@@ -141,13 +154,18 @@ export function getSetting<K extends BoardSettingKey>(store: BoardStore, key: K)
 }
 
 export function setSetting<K extends BoardSettingKey>(store: BoardStore, key: K, value: typeof defaultSettings[K]): void {
-  if (key === "max_slots" || key === "stale_minutes" || key === "tick_seconds" || key === "pause_backoff_minutes"
+  if (key === "max_slots" || key === "stale_minutes" || key === "tick_seconds" || key === "pause_backoff_minutes" || key === "web_port"
     || key === "memory_limit_gb" || key === "executor_memory_gb") {
     if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
       throw new TypeError(`${key} must be a positive number`);
     }
     if (key === "max_slots" && !Number.isInteger(value)) throw new TypeError("max_slots must be a positive integer");
+    if (key === "web_port" && (!Number.isInteger(value) || value > 65535)) throw new TypeError("web_port must be an integer from 1 to 65535");
   }
+  if (key === "notify_app_id" && (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value))) {
+    throw new TypeError("notify_app_id must be a simple app id");
+  }
+  if (key === "notify_enabled" && typeof value !== "boolean") throw new TypeError("notify_enabled must be a boolean");
   if (key === "paused_until" && value !== null && (typeof value !== "string" || Number.isNaN(Date.parse(value)))) {
     throw new TypeError("paused_until must be an ISO date or null");
   }
@@ -194,6 +212,7 @@ function boardEventFromRow(row: typeof boardEvents.$inferSelect): BoardEvent {
     ts: row.ts,
     kind: BoardEventKindSchema.parse(row.kind),
     task: row.task,
+    epic: row.epic,
     question: row.question,
     run: row.run,
     payload: JSON.parse(row.payload) as unknown,
@@ -203,6 +222,7 @@ function boardEventFromRow(row: typeof boardEvents.$inferSelect): BoardEvent {
 export interface CreateBoardEventInput {
   kind: BoardEventKind;
   task?: string | null;
+  epic?: string | null;
   question?: string | null;
   run?: string | null;
   payload: unknown;
@@ -210,6 +230,7 @@ export interface CreateBoardEventInput {
 
 export interface BoardEventIdentity {
   task?: string;
+  epic?: string;
   question?: string;
   run?: string;
 }
@@ -222,6 +243,7 @@ export function emitBoardEvent(store: BoardStore, input: CreateBoardEventInput, 
     if (identity) {
       const conditions = [eq(boardEvents.kind, kind)];
       if (identity.task !== undefined) conditions.push(eq(boardEvents.task, identity.task));
+      if (identity.epic !== undefined) conditions.push(eq(boardEvents.epic, identity.epic));
       if (identity.question !== undefined) conditions.push(eq(boardEvents.question, identity.question));
       if (identity.run !== undefined) conditions.push(eq(boardEvents.run, identity.run));
       const existing = store.db.select({ seq: boardEvents.seq }).from(boardEvents).where(and(...conditions)).get();
@@ -234,6 +256,7 @@ export function emitBoardEvent(store: BoardStore, input: CreateBoardEventInput, 
       ts: now(),
       kind,
       task: input.task ?? null,
+      epic: input.epic ?? null,
       question: input.question ?? null,
       run: input.run ?? null,
       payload: jsonEncode(input.payload),
@@ -446,12 +469,35 @@ export function setTaskPriority(store: BoardStore, id: string, prio: number): St
 export function listAnsweredDecisionsForTask(store: BoardStore, id: string) {
   const task = getTask(store, id);
   const project = getEpic(store, task.epic).project;
-  if (task.decisions.length === 0) return [];
+  const answeredQuestionKeys = store.db.select({ key: questions.decisionKey }).from(questions)
+    .where(and(eq(questions.task, id), eq(questions.status, "answered")))
+    .all()
+    .flatMap(({ key }) => key === null ? [] : [key]);
+  const decisionKeys = [...new Set([...task.decisions, ...answeredQuestionKeys])];
+  if (decisionKeys.length === 0) return [];
   return store.db.select().from(decisions)
-    .where(and(eq(decisions.project, project), inArray(decisions.key, task.decisions), eq(decisions.status, "answered")))
+    .where(and(eq(decisions.project, project), inArray(decisions.key, decisionKeys), eq(decisions.status, "answered")))
     .orderBy(asc(decisions.key))
     .all()
     .filter((decision): decision is typeof decision & { answer: string } => decision.answer !== null)
+    .map(({ key, answer }) => ({ key, answer }));
+}
+
+export function listAnsweredDecisionsForTaskSince(store: BoardStore, id: string, since: string) {
+  const task = getTask(store, id);
+  const project = getEpic(store, task.epic).project;
+  const answeredQuestionKeys = store.db.select({ key: questions.decisionKey }).from(questions)
+    .where(and(eq(questions.task, id), eq(questions.status, "answered")))
+    .all()
+    .flatMap(({ key }) => key === null ? [] : [key]);
+  const decisionKeys = [...new Set([...task.decisions, ...answeredQuestionKeys])];
+  if (decisionKeys.length === 0) return [];
+  return store.db.select().from(decisions)
+    .where(and(eq(decisions.project, project), inArray(decisions.key, decisionKeys), eq(decisions.status, "answered")))
+    .orderBy(asc(decisions.key))
+    .all()
+    .filter((decision): decision is typeof decision & { answer: string; answeredAt: string } =>
+      decision.answer !== null && decision.answeredAt !== null && decision.answeredAt >= since)
     .map(({ key, answer }) => ({ key, answer }));
 }
 
@@ -573,6 +619,32 @@ export function answerQuestion(store: BoardStore, id: string, answer: string, re
   }
 }
 
+/** Apply the answer and status-transition rules shared by the CLI and the local web API. */
+export function answerQuestionAndTransition(store: BoardStore, id: string, answer: string, reject = false) {
+  const question = getQuestion(store, id);
+  if (question.kind === "stop" && getTask(store, question.task).status !== "needs_owner") {
+    if (question.target === "owner") throw new RuleRefusalError(`Task ${question.task} is not waiting for an owner answer`);
+  }
+  const answered = answerQuestion(store, id, answer, reject);
+  const task = question.kind === "stop"
+    && question.target === "owner"
+    ? transitionTask(store, question.task, "owner_answered", "owner")
+    : getTask(store, question.task);
+  return { question: answered, task };
+}
+
+/** Apply the owner-only checks around the shared CLI answer flow. */
+export function answerOwnerQuestion(store: BoardStore, id: string, answer: string, reject = false) {
+  if (typeof answer !== "string" || answer.trim().length === 0) throw new RuleRefusalError("Answer text must not be empty");
+  const question = getQuestion(store, id);
+  if (question.target !== "owner") throw new RuleRefusalError(`Question ${id} is not addressed to the owner`);
+  if (question.kind === "stop" && getTask(store, question.task).status !== "needs_owner") {
+    throw new RuleRefusalError(`Task ${question.task} is not waiting for an owner answer`);
+  }
+  if (reject && question.kind !== "assume") throw new RuleRefusalError("Only assumption questions can be rejected");
+  return answerQuestionAndTransition(store, id, answer.trim(), reject);
+}
+
 export function getQuestion(store: BoardStore, id: string) {
   const row = store.db.select().from(questions).where(eq(questions.id, id)).get();
   if (!row) throw new StoreNotFoundError("Question", id);
@@ -615,6 +687,7 @@ export interface CreateRunInput {
   task: string;
   round?: number;
   executor: string;
+  resumeSessionId?: string | null;
   reportPath?: string | null;
   rawPath?: string | null;
 }
@@ -629,6 +702,7 @@ export function createRun(store: BoardStore, input: CreateRunInput) {
     round,
     executor: input.executor,
     sessionId: null,
+    resumeSessionId: input.resumeSessionId ?? null,
     pid: null,
     startedAt: now(),
     endedAt: null,
@@ -928,6 +1002,49 @@ export function hasApproval(store: BoardStore, epic: string, kind: string): bool
 
 export function listApprovals(store: BoardStore, epic: string) {
   return store.db.select().from(approvals).where(eq(approvals.epic, epic)).orderBy(asc(approvals.createdAt)).all();
+}
+
+export function hasWebMergeApproval(store: BoardStore, epicId: string): boolean {
+  return store.db.select({ id: approvals.id }).from(approvals)
+    .where(and(eq(approvals.epic, epicId), eq(approvals.kind, "merge"), eq(approvals.source, "web"))).get() !== undefined;
+}
+
+export function approveEpicForWeb(store: BoardStore, epicId: string) {
+  const epic = getEpic(store, epicId);
+  const epicTasks = listTasksByEpic(store, epicId);
+  if (epicTasks.length === 0 || epicTasks.some((task) => task.status !== "done" && task.status !== "canceled")) {
+    throw new RuleRefusalError(`Epic ${epicId} is not ready: every task must be done or canceled`);
+  }
+  if (hasWebMergeApproval(store, epicId)) throw new RuleRefusalError(`Epic ${epicId} already has web merge approval`);
+  const approval = addApproval(store, { epic: epicId, kind: "merge", source: "web" });
+  store.db.update(epics).set({ mergeApprovedAt: approval.createdAt }).where(eq(epics.id, epicId)).run();
+  return { epic, approval };
+}
+
+export function updateEpicStatus(store: BoardStore, epicId: string, status: string): void {
+  getEpic(store, epicId);
+  store.db.update(epics).set({ status }).where(eq(epics.id, epicId)).run();
+}
+
+export function writeEpicLog(store: BoardStore, input: { epic: string; actor: string; action: string; note?: string | null }) {
+  getEpic(store, input.epic);
+  return store.db.insert(epicLog).values({ epic: input.epic, ts: now(), actor: input.actor, action: input.action, note: input.note ?? null }).returning().get();
+}
+
+export function listEpicLog(store: BoardStore, epicId: string) {
+  getEpic(store, epicId);
+  return store.db.select().from(epicLog).where(eq(epicLog.epic, epicId)).orderBy(asc(epicLog.id)).all();
+}
+
+export function recordNotification(store: BoardStore, input: { id?: string; kind: string; ref: string; app_id: string; delivered: boolean; error?: string | null }) {
+  return store.db.insert(notifications).values({
+    id: input.id ?? crypto.randomUUID(), ts: now(), kind: input.kind, ref: input.ref,
+    appId: input.app_id, delivered: input.delivered, error: input.error ?? null,
+  }).returning().get();
+}
+
+export function listNotifications(store: BoardStore) {
+  return store.db.select().from(notifications).orderBy(desc(notifications.ts), desc(notifications.id)).all();
 }
 
 export function canStartTask(store: BoardStore, id: string) {

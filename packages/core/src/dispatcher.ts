@@ -8,10 +8,15 @@ import {
   getInternalSetting,
   getLatestRunEvent,
   getTask,
+  getEpic,
   getSetting,
   listRunsForTask,
   listTasks,
   listTasksByStatus,
+  listEpics,
+  listTasksByEpic,
+  listQuestions,
+  hasApproval,
   setInternalSetting,
   setSetting,
   finishRun,
@@ -20,6 +25,15 @@ import {
   updateGateRun,
 } from "./store";
 import { cleanupDeadMemoryLeases } from "./memory/ledger";
+import { notifyCause, type Notifier, type RegistryWriter } from "./notify";
+
+export interface NotificationDraft {
+  kind: "owner_question" | "epic_ready";
+  ref: string;
+  title: string;
+  text: string;
+  launch: string;
+}
 
 export interface DispatcherTickResult {
   ready: string[];
@@ -27,11 +41,13 @@ export interface DispatcherTickResult {
   failed: string[];
   paused: string[];
   resumed: boolean;
+  notifications: NotificationDraft[];
 }
 
 export interface DispatcherOptions {
   now?: Date;
   isAlive?: (pid: number) => boolean;
+  onNotification?: (draft: NotificationDraft) => void;
 }
 
 export function isProcessAlive(pid: number): boolean {
@@ -141,7 +157,7 @@ export function dispatchTick(store: BoardStore, options: DispatcherOptions = {})
   const now = options.now ?? new Date();
   const isAlive = options.isAlive ?? isProcessAlive;
   const staleLimitMs = getSetting(store, "stale_minutes") * 60_000;
-  const result: DispatcherTickResult = { ready: [], stale: [], failed: [], paused: [], resumed: false };
+  const result: DispatcherTickResult = { ready: [], stale: [], failed: [], paused: [], resumed: false, notifications: [] };
 
   for (const lease of cleanupDeadMemoryLeases(store, isAlive)) {
     if (lease.kind === "gate") {
@@ -190,6 +206,51 @@ export function dispatchTick(store: BoardStore, options: DispatcherOptions = {})
   result.paused = handleCompletedRuns(store, now);
   result.resumed = recordResumeIfDue(store, now);
 
+  const webPort = getSetting(store, "web_port");
+  for (const question of listQuestions(store, { open: true, target: "owner" })) {
+    const task = getTask(store, question.task);
+    const event = emitBoardEvent(store, {
+      kind: "owner_question",
+      task: task.id,
+      question: question.id,
+      payload: { kind: question.kind },
+    }, { question: question.id });
+    if (!event) continue;
+    const epic = getEpic(store, task.epic);
+    const heldCount = question.decisionKey === null ? 0 : listTasks(store)
+      .filter((candidate) => getEpic(store, candidate.epic).project === epic.project && candidate.decisions.includes(question.decisionKey!)).length;
+    const draft: NotificationDraft = {
+      kind: "owner_question",
+      ref: question.id,
+      title: `Question for you · holds ${heldCount} ${heldCount === 1 ? "task" : "tasks"}`,
+      text: question.text,
+      launch: `http://127.0.0.1:${webPort}/#q=${encodeURIComponent(question.id)}`,
+    };
+    result.notifications.push(draft);
+    options.onNotification?.(draft);
+  }
+
+  for (const epic of listEpics(store)) {
+    const epicTasks = listTasksByEpic(store, epic.id);
+    if (epicTasks.length === 0 || epicTasks.some((task) => task.status !== "done" && task.status !== "canceled")
+      || hasApproval(store, epic.id, "merge")) continue;
+    const event = emitBoardEvent(store, {
+      kind: "epic_ready",
+      epic: epic.id,
+      payload: { epic: epic.id },
+    }, { epic: epic.id });
+    if (!event) continue;
+    const draft: NotificationDraft = {
+      kind: "epic_ready",
+      ref: epic.id,
+      title: "Epic ready for merge approval",
+      text: epic.title,
+      launch: `http://127.0.0.1:${webPort}/#epic=${encodeURIComponent(epic.id)}`,
+    };
+    result.notifications.push(draft);
+    options.onNotification?.(draft);
+  }
+
   const nextTasks = new Set(listTasksByStatus(store, "next").map((task) => task.id));
   for (const task of listTasks(store)) {
     const key = `dispatcher.ready:${task.id}`;
@@ -237,7 +298,7 @@ export function acquireServeLock(store: BoardStore): () => void {
   throw new Error("Could not acquire the dispatcher lock after removing a stale lock.");
 }
 
-export async function serveDispatcher(store: BoardStore, options: { once?: boolean } = {}): Promise<void> {
+export async function serveDispatcher(store: BoardStore, options: { once?: boolean; notifier?: Notifier; registry?: RegistryWriter } = {}): Promise<void> {
   const release = acquireServeLock(store);
   let stop = false;
   const requestStop = () => { stop = true; };
@@ -245,7 +306,10 @@ export async function serveDispatcher(store: BoardStore, options: { once?: boole
   process.once("SIGTERM", requestStop);
   try {
     do {
-      dispatchTick(store);
+      const tick = dispatchTick(store);
+      for (const draft of tick.notifications) {
+        try { await notifyCause(store, draft, { notifier: options.notifier, registry: options.registry }); } catch { /* Notification failures are logged where possible and do not stop dispatch. */ }
+      }
       if (options.once || stop) break;
       await new Promise((resolve) => setTimeout(resolve, getSetting(store, "tick_seconds") * 1000));
     } while (!stop);

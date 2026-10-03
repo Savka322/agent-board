@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ExecutorReportSchema, executorReportJsonSchema, type ExecutorReport, type ProjectProfile } from "@agent-board/contracts";
 import { normalizeCodexLine } from "./codex-normalizer";
-import { buildPrompt, buildResumePrompt } from "./prompts";
+import { buildContinuationPrompt, buildPrompt, buildResumePrompt } from "./prompts";
 import {
   appendEvents,
   closeStore,
@@ -17,6 +17,7 @@ import {
   getRun,
   getTask,
   listAnsweredDecisionsForTask,
+  listAnsweredDecisionsForTaskSince,
   listRunsForTask,
   openStore,
   setRunPid,
@@ -38,6 +39,11 @@ export interface StartResult {
   task: string;
   round: number;
   pid: number | undefined;
+}
+
+export interface StartOptions {
+  fresh?: boolean;
+  notePath?: string;
 }
 
 interface RunFiles {
@@ -84,13 +90,21 @@ function spawnDetachedRunner(runId: string): StartResult["pid"] {
   return child.pid;
 }
 
-export function startTask(store: ReturnType<typeof openStore>, taskId: string): StartResult {
+export function startTask(store: ReturnType<typeof openStore>, taskId: string, options: StartOptions = {}): StartResult {
   const currentTask = getTask(store, taskId);
+  const note = options.notePath === undefined ? undefined : readFileSync(options.notePath, "utf8");
+  const latestRun = listRunsForTask(store, taskId).at(-1);
+  const previousSessionId = currentTask.round >= 1 && latestRun?.round === currentTask.round
+    ? latestRun.sessionId ?? undefined
+    : undefined;
+  const resumeSessionId = options.fresh ? undefined : previousSessionId;
+  const continuesSession = resumeSessionId !== undefined;
   const epic = getEpic(store, currentTask.epic);
   const profile = getProject(store, epic.project).profile;
   const runId = crypto.randomUUID();
   const leaseBytes = executorMemoryBytes(store);
-  const task = transitionTask(store, taskId, "start", "claude", undefined, undefined, {
+  const task = transitionTask(store, taskId, "start", "claude", undefined,
+    continuesSession ? `continued session ${resumeSessionId}` : "started fresh", {
     id: runId,
     kind: "executor",
     ref: runId,
@@ -102,7 +116,13 @@ export function startTask(store: ReturnType<typeof openStore>, taskId: string): 
     ensureTaskWorktree(store, taskId);
     files = runFiles(store.home, taskId, task.round);
     if (existsSync(files.directory)) throw new Error(`Run directory already exists for ${taskId} round ${task.round}`);
-    prompt = buildPrompt({ profile, card: task.card, decisions: listAnsweredDecisionsForTask(store, taskId) });
+    prompt = continuesSession && latestRun
+      ? buildContinuationPrompt({
+        decisions: listAnsweredDecisionsForTaskSince(store, taskId, latestRun.startedAt),
+        rateLimited: latestRun.outcome === "rate_limited",
+        note,
+      })
+      : buildPrompt({ profile, card: task.card, decisions: listAnsweredDecisionsForTask(store, taskId), resumeNote: note });
   } catch (error) {
     releaseMemoryLease(store, runId);
     transitionTask(store, taskId, "run_finished", "runner");
@@ -110,7 +130,15 @@ export function startTask(store: ReturnType<typeof openStore>, taskId: string): 
   }
   let run: ReturnType<typeof createRun>;
   try {
-    run = createRun(store, { id: runId, task: taskId, round: task.round, executor: profile.executor.model, reportPath: files.report, rawPath: files.raw });
+    run = createRun(store, {
+      id: runId,
+      task: taskId,
+      round: task.round,
+      executor: profile.executor.model,
+      resumeSessionId,
+      reportPath: files.report,
+      rawPath: files.raw,
+    });
   } catch (error) {
     releaseMemoryLease(store, runId);
     transitionTask(store, taskId, "run_finished", "runner");
@@ -118,6 +146,7 @@ export function startTask(store: ReturnType<typeof openStore>, taskId: string): 
   }
   try {
     writePromptAndSchema(files, prompt);
+    if (note !== undefined) writeFileSync(files.note, note, "utf8");
     const pid = spawnDetachedRunner(run.id);
     if (pid !== undefined) setRunPid(store, run.id, pid);
     if (pid !== undefined) setMemoryLeasePid(store, run.id, pid);
@@ -161,7 +190,15 @@ export function resumeTask(store: ReturnType<typeof openStore>, taskId: string, 
   }
   let run: ReturnType<typeof createRun>;
   try {
-    run = createRun(store, { id: runId, task: taskId, round: runningTask.round, executor: profile.executor.model, reportPath: files.report, rawPath: files.raw });
+    run = createRun(store, {
+      id: runId,
+      task: taskId,
+      round: runningTask.round,
+      executor: profile.executor.model,
+      resumeSessionId: prior.sessionId,
+      reportPath: files.report,
+      rawPath: files.raw,
+    });
   } catch (error) {
     releaseMemoryLease(store, runId);
     transitionTask(store, taskId, "run_finished", "runner");
@@ -195,6 +232,16 @@ export function stopTask(store: ReturnType<typeof openStore>, taskId: string) {
   transitionTask(store, taskId, "run_finished", "runner");
   emitBoardEvent(store, { kind: "review", task: taskId, run: active.id, payload: "canceled" }, { run: active.id });
   return { task: taskId, run_id: active.id, outcome: "canceled" as const };
+}
+
+export function cancelTask(
+  store: ReturnType<typeof openStore>,
+  taskId: string,
+  stopRunner: (store: ReturnType<typeof openStore>, id: string) => unknown = stopTask,
+  actor: "claude" | "owner" = "owner",
+) {
+  if (getTask(store, taskId).status === "running") stopRunner(store, taskId);
+  return transitionTask(store, taskId, "cancel", actor);
 }
 
 function parseCommandPrefix(value: string | undefined): string[] {
@@ -254,8 +301,7 @@ async function runExecutor(store: ReturnType<typeof openStore>, runId: string, r
   const worktree = getTaskWorktreePath(store, task.id);
   const files = runFiles(store.home, task.id, run.round);
   setRunPid(store, runId, process.pid);
-  const previous = run.round > 1 ? listRunsForTask(store, task.id).find((item) => item.round === run.round - 1) : undefined;
-  const codex = codexArguments(profile, files, previous?.sessionId ?? undefined);
+  const codex = codexArguments(profile, files, run.resumeSessionId ?? undefined);
   const child = spawn(codex.command, codex.args, { cwd: worktree, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");

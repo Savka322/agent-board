@@ -36,6 +36,20 @@
       "when": 1790987265149,
       "tag": "0004_gate_attempts",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1790995461000,
+      "tag": "0005_owner_actions",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1790997813097,
+      "tag": "0006_runner_resume",
+      "breakpoints": true
     }
   ]
 }

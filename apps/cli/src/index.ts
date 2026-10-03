@@ -1,11 +1,15 @@
 import { parseArgs } from "node:util";
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { BoardEventKindSchema, ExecutorQuestionSchema, TaskCardSchema, type BoardEventKind } from "@agent-board/contracts";
-import { answerQuestion, addProject, addTask, canStartTask, closeStore, createEpic, createQuestion, getEpic, getProject, getQuestion, getRun, getTask, IllegalTaskTransitionError, listEventsAfter, listEpics, listQuestions, listRecentBoardEvents, listRunsForTask, listSettings, listTaskLog, listTasks, listTasksByEpic, openStore, serveDispatcher, setSetting, setTaskPriority, transitionTask, waitForBoardEvents, gateInternal, runGates, memoryStatus, MemoryLeaseUnavailableError } from "@agent-board/core";
+import { answerQuestionAndTransition, addProject, addTask, canStartTask, cancelTask, closeStore, createEpic, createQuestion, EpicMergeRefusalError, getEpic, getProject, getRun, getSetting, getTask, IllegalTaskTransitionError, listEventsAfter, listEpics, listQuestions, listRecentBoardEvents, listRunsForTask, listSettings, listTaskLog, listTasks, listTasksByEpic, mergeEpic, openStore, serveDispatcher, setSetting, setTaskPriority, transitionTask, waitForBoardEvents, gateInternal, runGates, memoryStatus, MemoryLeaseUnavailableError, RuleRefusalError, hasWebMergeApproval, notifyCause, installNotificationApp, uninstallNotificationApp } from "@agent-board/core";
 import { AcceptanceRefusedError, acceptTask, rejectTask, reviewSummary } from "@agent-board/core";
 import { resumeTask, runInternal, startTask, stopTask } from "@agent-board/core";
 import { ensureEpicWorktree, epicBranchName, getEpicWorktreePath } from "@agent-board/core";
 import type { BoardStore } from "@agent-board/core";
+import { installSkill, SkillInstallRefusalError } from "./install-skill";
 
 const optionDefinitions = {
   json: { type: "boolean" },
@@ -28,6 +32,9 @@ const optionDefinitions = {
   target: { type: "string" },
   reject: { type: "boolean" },
   once: { type: "boolean" },
+  "no-web": { type: "boolean" },
+  force: { type: "boolean" },
+  fresh: { type: "boolean" },
 } as const;
 
 interface CliOptions {
@@ -51,6 +58,9 @@ interface CliOptions {
   target?: string;
   reject: boolean;
   once: boolean;
+  noWeb: boolean;
+  force: boolean;
+  fresh: boolean;
 }
 
 class CliRefusal extends Error {
@@ -85,6 +95,9 @@ function parseCli(args: string[]): { positionals: string[]; options: CliOptions 
       target: parsed.values.target,
       reject: parsed.values.reject ?? false,
       once: parsed.values.once ?? false,
+      noWeb: parsed.values["no-web"] ?? false,
+      force: parsed.values.force ?? false,
+      fresh: parsed.values.fresh ?? false,
     },
   };
 }
@@ -106,8 +119,9 @@ function humanTask(task: ReturnType<typeof getTask>): string {
 const allCommandUsage = [
   "Usage: agentctl project add|show <name>",
   "Usage: agentctl epic new <project> <id> <title> | epic status <id>",
+  "Usage: agentctl epic merge <id>",
   "Usage: agentctl task add <epic> <card> | task show|promote|cancel <id> | task prio <id> <number>",
-  "Usage: agentctl start <task-id>",
+  "Usage: agentctl start <task-id> [--fresh] [--note <file>]",
   "Usage: agentctl resume <task-id> --note <file>",
   "Usage: agentctl stop|review|accept|reject <task-id> [--allow-extra <reason>]",
   "Usage: agentctl ask <task-id> --kind stop|assume --decision <key> --text <text> --recommend <text> [--option <text>...]",
@@ -115,7 +129,9 @@ const allCommandUsage = [
   "Usage: agentctl questions [--open] [--target owner|claude] [--json]",
   "Usage: agentctl status [--epic <id>] [--json]",
   "Usage: agentctl wait --for <kind,...> [--after <seq>] [--timeout <seconds>] [--json]",
-  "Usage: agentctl serve [--once]",
+  "Usage: agentctl serve [--once] [--no-web]",
+  "Usage: agentctl notify install|uninstall|test",
+  "Usage: agentctl install-skill [--target <dir>] [--force]",
   "Usage: agentctl gate <task-id> [--json]",
   "Usage: agentctl memory [--json]",
   "Usage: agentctl settings [--set key=value]...",
@@ -134,6 +150,42 @@ function helpFor(positionals: string[]): string {
     if (specific) return specific;
   }
   return matching.join("\n");
+}
+
+async function startWebProcess(): Promise<ChildProcess> {
+  const entrypoint = resolve(dirname(fileURLToPath(import.meta.url)), "../../server/src/main.ts");
+  const child = spawn(process.execPath, [entrypoint], { cwd: process.cwd(), env: process.env, windowsHide: true, stdio: ["ignore", "pipe", "inherit"] });
+  return await new Promise<ChildProcess>((resolvePromise, rejectPromise) => {
+    let output = "";
+    let settled = false;
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      rejectPromise(error);
+    };
+    child.once("error", fail);
+    child.once("exit", (code, signal) => {
+      if (!settled) fail(new Error(`Web server exited before starting (code ${code ?? "none"}, signal ${signal ?? "none"})`));
+    });
+    child.stdout?.on("data", (chunk: Buffer) => {
+      const value = chunk.toString("utf8");
+      process.stdout.write(value);
+      output += value;
+      if (!settled && /listening at http:\/\/127\.0\.0\.1:\d+/.test(output)) {
+        settled = true;
+        resolvePromise(child);
+      }
+    });
+  });
+}
+
+async function stopWebProcess(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  child.kill();
+  await new Promise<void>((resolvePromise) => {
+    const timeout = setTimeout(resolvePromise, 2000);
+    child.once("exit", () => { clearTimeout(timeout); resolvePromise(); });
+  });
 }
 
 function compactStatus(store: BoardStore, tasks: ReturnType<typeof listTasks>) {
@@ -256,7 +308,14 @@ async function dispatch(store: BoardStore, positionals: string[], options: CliOp
       emit(result, options.json, `${epic.id} [${epic.status}] ${epic.title}: ${tasks.length} task(s)`);
       return;
     }
-    throw new TypeError("Usage: agentctl epic new|status ...");
+    if (action === "merge") {
+      const epicId = required(rest[0], "epic id");
+      if (!hasWebMergeApproval(store, epicId)) throw new CliRefusal(`Epic ${epicId} has no web merge approval`);
+      const result = mergeEpic(store, epicId);
+      emit(result, options.json, `Merged ${result.branch} into ${result.merged_into} (${result.commit.slice(0, 12)}).`);
+      return;
+    }
+    throw new TypeError("Usage: agentctl epic new|status|merge ...");
   }
 
   if (command === "task") {
@@ -287,7 +346,7 @@ async function dispatch(store: BoardStore, positionals: string[], options: CliOp
       return;
     }
     if (action === "cancel") {
-      const task = transitionTask(store, required(rest[0], "task id"), "cancel", "claude");
+      const task = cancelTask(store, required(rest[0], "task id"), undefined, "claude");
       emit(task, options.json, `Canceled ${task.id}.`);
       return;
     }
@@ -295,7 +354,10 @@ async function dispatch(store: BoardStore, positionals: string[], options: CliOp
   }
 
   if (command === "start") {
-    const result = startTask(store, required(subcommand, "task id"));
+    const result = startTask(store, required(subcommand, "task id"), {
+      fresh: options.fresh,
+      ...(options.note === undefined ? {} : { notePath: options.note }),
+    });
     emit(result, options.json, `Started ${result.task}; run ${result.run_id} is running in the background.`);
     return;
   }
@@ -368,15 +430,8 @@ async function dispatch(store: BoardStore, positionals: string[], options: CliOp
   if (command === "answer") {
     const questionId = required(subcommand, "question id");
     const answer = required(rest.join(" "), "answer text");
-    const question = getQuestion(store, questionId);
-    if (question.target === "owner" && question.kind === "stop" && getTask(store, question.task).status !== "needs_owner") {
-      throw new CliRefusal(`Task ${question.task} is not waiting for an owner answer`);
-    }
-    const answered = answerQuestion(store, questionId, answer, options.reject);
-    const task = question.target === "owner" && question.kind === "stop"
-      ? transitionTask(store, question.task, "owner_answered", "owner")
-      : getTask(store, question.task);
-    emit({ question: answered, task }, options.json, `Answered ${questionId}; ${task.id} is ${task.status}.`);
+    const result = answerQuestionAndTransition(store, questionId, answer, options.reject);
+    emit(result, options.json, `Answered ${questionId}; ${result.task.id} is ${result.task.status}.`);
     return;
   }
   if (command === "questions") {
@@ -417,8 +472,48 @@ async function dispatch(store: BoardStore, positionals: string[], options: CliOp
     return;
   }
   if (command === "serve") {
-    await serveDispatcher(store, { once: options.once });
-    emit({ running: !options.once }, options.json, options.once ? "Dispatcher tick completed." : "Dispatcher stopped.");
+    const web = options.noWeb ? null : await startWebProcess();
+    const port = getSetting(store, "web_port");
+    try {
+      await serveDispatcher(store, { once: options.once });
+      emit({ running: !options.once, web: web ? `http://127.0.0.1:${port}` : null }, options.json,
+        options.once ? "Dispatcher tick completed." : "Dispatcher stopped.");
+    } finally {
+      if (web) await stopWebProcess(web);
+    }
+    return;
+  }
+  if (command === "notify") {
+    const action = required(subcommand, "notify action");
+    const appId = getSetting(store, "notify_app_id");
+    if (action === "install") {
+      installNotificationApp(appId);
+      emit({ app_id: appId, installed: true }, options.json, `Registered Windows notifications for ${appId}.`);
+      return;
+    }
+    if (action === "uninstall") {
+      uninstallNotificationApp(appId);
+      emit({ app_id: appId, installed: false }, options.json, `Removed Windows notifications for ${appId}.`);
+      return;
+    }
+    if (action === "test") {
+      const result = await notifyCause(store, {
+        kind: "test",
+        ref: crypto.randomUUID(),
+        title: "agent-board notification test",
+        text: "Windows toast notifications are connected.",
+        launch: `http://127.0.0.1:${getSetting(store, "web_port")}/`,
+      }, undefined, true);
+      emit({ app_id: result?.appId ?? appId, delivered: result?.delivered ?? false, error: result?.error ?? null }, options.json,
+        result?.delivered ? "Sent a Windows notification test." : `Windows notification test failed: ${result?.error ?? "unknown delivery failure"}`);
+      return result?.delivered ? 0 : 1;
+    }
+    throw new TypeError("Usage: agentctl notify install|uninstall|test");
+  }
+  if (command === "install-skill") {
+    const result = installSkill({ target: options.target, force: options.force });
+    const action = result.alreadyCurrent ? "Already up to date at" : "Copied agent-board skill to";
+    emit(result, options.json, `${action} ${result.target}:\n${result.files.map((path) => `  ${path}`).join("\n")}`);
     return;
   }
   if (command === "memory") {
@@ -436,7 +531,7 @@ async function dispatch(store: BoardStore, positionals: string[], options: CliOp
       if (separator < 1) throw new TypeError("Settings use --set key=value");
       const key = assignment.slice(0, separator);
       const rawValue = assignment.slice(separator + 1);
-      if (!Object.hasOwn({ max_slots: 1, stale_minutes: 1, tick_seconds: 1, paused_until: 1, pause_backoff_minutes: 1, memory_limit_gb: 1, executor_memory_gb: 1 }, key)) {
+      if (!Object.hasOwn({ max_slots: 1, stale_minutes: 1, tick_seconds: 1, paused_until: 1, pause_backoff_minutes: 1, memory_limit_gb: 1, executor_memory_gb: 1, web_port: 1, notify_app_id: 1, notify_enabled: 1 }, key)) {
         throw new TypeError(`Unknown setting: ${key}`);
       }
       let value: unknown;
@@ -468,7 +563,7 @@ async function dispatch(store: BoardStore, positionals: string[], options: CliOp
 }
 
 export async function main(args = process.argv.slice(2)): Promise<number> {
-  let options: CliOptions = { json: false, follow: false, raw: false, help: false, open: false, reject: false, once: false };
+  let options: CliOptions = { json: false, follow: false, raw: false, help: false, open: false, reject: false, once: false, noWeb: false, force: false, fresh: false };
   try {
     const parsed = parseCli(args);
     options = parsed.options;
@@ -493,7 +588,7 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
       closeStore(store);
     }
   } catch (error) {
-    const refused = error instanceof CliRefusal || error instanceof AcceptanceRefusedError || error instanceof IllegalTaskTransitionError || error instanceof MemoryLeaseUnavailableError;
+    const refused = error instanceof CliRefusal || error instanceof AcceptanceRefusedError || error instanceof IllegalTaskTransitionError || error instanceof MemoryLeaseUnavailableError || error instanceof RuleRefusalError || error instanceof EpicMergeRefusalError || error instanceof SkillInstallRefusalError;
     const code = refused ? 2 : 1;
     const transitionDetails = error instanceof IllegalTaskTransitionError ? error.transition.error : undefined;
     const message = error instanceof Error ? error.message : String(error);

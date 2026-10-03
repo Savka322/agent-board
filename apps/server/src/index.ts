@@ -2,9 +2,15 @@ import { Hono } from "hono";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { extname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomBytes } from "node:crypto";
+import { OwnerAnswerBodySchema, TaskPriorityBodySchema } from "@agent-board/contracts";
 import {
+  answerOwnerQuestion,
+  approveEpicForWeb,
   boardSnapshot,
+  cancelTask,
   closeStore,
+  getSetting,
   getRun,
   getTask,
   listBoardEventsAfter,
@@ -13,6 +19,9 @@ import {
   listRecentEvents,
   listRunsForTask,
   openStore,
+  RuleRefusalError,
+  setTaskPriority,
+  IllegalTaskTransitionError,
   taskDetail,
   type BoardStore,
 } from "@agent-board/core";
@@ -28,14 +37,8 @@ function isPort(value: unknown): value is number {
 }
 
 function configuredPort(store: BoardStore): number {
-  try {
-    const row = store.sqlite.query("SELECT value FROM settings WHERE key = ?").get("web_port") as { value?: unknown } | null;
-    if (typeof row?.value !== "string") return DEFAULT_WEB_PORT;
-    const value: unknown = JSON.parse(row.value);
-    return isPort(value) ? value : DEFAULT_WEB_PORT;
-  } catch {
-    return DEFAULT_WEB_PORT;
-  }
+  const port = getSetting(store, "web_port");
+  return isPort(port) ? port : DEFAULT_WEB_PORT;
 }
 
 function parseInteger(raw: string | undefined, fallback: number, minimum: number, maximum: number): number | null {
@@ -172,13 +175,86 @@ function serveWebFile(pathname: string): Response | null {
   return new Response(Bun.file(filePath), { headers: { "Content-Type": contentType(filePath) } });
 }
 
-export function createApp(store: BoardStore, port = DEFAULT_WEB_PORT): Hono {
+export interface CreateAppOptions {
+  stopRunner?: (store: BoardStore, id: string) => unknown;
+}
+
+function refusal(context: { json: (value: unknown, status?: number) => Response }, error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return context.json({ error: message, reason: message }, 409);
+}
+
+export function createApp(store: BoardStore, port = DEFAULT_WEB_PORT, token = randomBytes(32).toString("hex"), options: CreateAppOptions = {}): Hono {
   const app = new Hono();
 
   app.use("*", async (context, next) => {
     const host = context.req.header("host");
     if (host !== `127.0.0.1:${port}` && host !== `localhost:${port}`) return context.text("Forbidden", 403);
     await next();
+  });
+
+  app.use("/api/*", async (context, next) => {
+    if (context.req.method !== "POST") return next();
+    const expectedOrigins = new Set([`http://127.0.0.1:${port}`, `http://localhost:${port}`]);
+    if (context.req.header("x-board-token") !== token || !expectedOrigins.has(context.req.header("origin") ?? "")) {
+      return context.text("Forbidden", 403);
+    }
+    return next();
+  });
+
+  app.get("/api/session", (context) => {
+    context.header("Cache-Control", "no-store");
+    return context.json({ token, port });
+  });
+
+  app.post("/api/questions/:id/answer", async (context) => {
+    let body: unknown;
+    try { body = await context.req.json(); } catch { return context.json({ error: "Invalid JSON body." }, 400); }
+    const parsed = OwnerAnswerBodySchema.safeParse(body);
+    if (!parsed.success) return context.json({ error: "Invalid answer body.", details: parsed.error.issues }, 400);
+    try {
+      return context.json(answerOwnerQuestion(store, context.req.param("id"), parsed.data.text, parsed.data.reject ?? false));
+    } catch (error) {
+      if (error instanceof RuleRefusalError || error instanceof IllegalTaskTransitionError || error instanceof TypeError) return refusal(context, error);
+      if (error instanceof Error && error.name === "StoreNotFoundError") return context.json({ error: error.message }, 404);
+      return context.json({ error: "Could not answer question." }, 500);
+    }
+  });
+
+  app.post("/api/tasks/:id/cancel", (context) => {
+    try {
+      return context.json(cancelTask(store, context.req.param("id"), options.stopRunner, "owner"));
+    } catch (error) {
+      if (error instanceof IllegalTaskTransitionError || error instanceof RuleRefusalError || error instanceof TypeError) return refusal(context, error);
+      if (error instanceof Error && error.name === "StoreNotFoundError") return context.json({ error: error.message }, 404);
+      return context.json({ error: error instanceof Error ? error.message : String(error) }, 500);
+    }
+  });
+
+  app.post("/api/tasks/:id/prio", async (context) => {
+    let body: unknown;
+    try { body = await context.req.json(); } catch { return context.json({ error: "Invalid JSON body." }, 400); }
+    const parsed = TaskPriorityBodySchema.safeParse(body);
+    if (!parsed.success) return context.json({ error: "Invalid priority body.", details: parsed.error.issues }, 400);
+    try {
+      const task = getTask(store, context.req.param("id"));
+      if (task.status !== "todo" && task.status !== "next") return refusal(context, new RuleRefusalError(`Priority can only change for todo or next tasks (current status: ${task.status})`));
+      return context.json(setTaskPriority(store, task.id, parsed.data.prio));
+    } catch (error) {
+      if (error instanceof RuleRefusalError || error instanceof TypeError) return refusal(context, error);
+      if (error instanceof Error && error.name === "StoreNotFoundError") return context.json({ error: error.message }, 404);
+      return context.json({ error: "Could not update task priority." }, 500);
+    }
+  });
+
+  app.post("/api/epics/:id/approve-merge", (context) => {
+    try {
+      return context.json(approveEpicForWeb(store, context.req.param("id")));
+    } catch (error) {
+      if (error instanceof RuleRefusalError || error instanceof TypeError) return refusal(context, error);
+      if (error instanceof Error && error.name === "StoreNotFoundError") return context.json({ error: error.message }, 404);
+      return context.json({ error: "Could not approve epic merge." }, 500);
+    }
   });
 
   app.get("/api/board", (context) => {
@@ -290,29 +366,34 @@ export function createApp(store: BoardStore, port = DEFAULT_WEB_PORT): Hono {
 export interface StartServerOptions {
   home?: string;
   port?: number;
+  token?: string;
+  store?: BoardStore;
 }
 
 export function startServer(options: StartServerOptions = {}) {
-  const store = options.home ? openStore(options.home) : openStore();
+  const ownsStore = options.store === undefined;
+  const store = options.store ?? (options.home ? openStore(options.home) : openStore());
   const port = options.port ?? configuredPort(store);
   if (!isPort(port)) {
-    closeStore(store);
+    if (ownsStore) closeStore(store);
     throw new RangeError("web port must be an integer from 1 to 65535");
   }
   try {
-    const app = createApp(store, port);
+    const token = options.token ?? randomBytes(32).toString("hex");
+    const app = createApp(store, port, token);
     const server = Bun.serve({ hostname: "127.0.0.1", port, fetch: app.fetch });
     return {
       server,
       store,
       port,
+      token,
       close() {
         server.stop(true);
-        closeStore(store);
+        if (ownsStore) closeStore(store);
       },
     };
   } catch (error) {
-    closeStore(store);
+    if (ownsStore) closeStore(store);
     throw error;
   }
 }

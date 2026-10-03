@@ -41,6 +41,9 @@ export type QuestionKind = z.infer<typeof QuestionKindSchema>;
 export const QuestionTargetSchema = z.enum(["claude", "owner"]);
 export type QuestionTarget = z.infer<typeof QuestionTargetSchema>;
 
+export const OwnerAnswerBodySchema = z.object({ text: z.string().trim().min(1), reject: z.boolean().optional() }).strict();
+export const TaskPriorityBodySchema = z.object({ prio: z.number().int() }).strict();
+
 export const GateStatusSchema = z.enum(["queued", "running", "pass", "fail", "oom"]);
 export type GateStatus = z.infer<typeof GateStatusSchema>;
 
@@ -91,6 +94,9 @@ export const BoardEventKindSchema = z.enum([
   "failed",
   "paused",
   "resumed",
+  "owner_question",
+  "epic_ready",
+  "epic_merged",
 ]);
 export type BoardEventKind = z.infer<typeof BoardEventKindSchema>;
 

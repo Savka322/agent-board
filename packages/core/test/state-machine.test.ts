@@ -42,11 +42,13 @@ describe("task state machine", () => {
     expect(applyTransition({ status: "done", round: 0 }, "cancel", "claude")).toMatchObject({ ok: false, error: { code: "wrong_status" } });
   });
 
-  test("starts run 1, permits only two resumes, and resets rejected work", () => {
+  test("limits starts and resumes to three runs, and resets rejected work", () => {
     expect(applyTransition({ status: "next", round: 0 }, "start", "claude")).toMatchObject({ ok: false, error: { code: "start_blocked" } });
     expect(applyTransition({ status: "next", round: 0 }, "start", "claude", { canStart: { ok: false, reasons: [{ code: "no_slot" }] } })).toMatchObject({ ok: false, error: { code: "start_blocked", reasons: [{ code: "no_slot" }] } });
     expect(applyTransition({ status: "next", round: 0 }, "start", "claude", { canStart: { ok: true, reasons: [] } })).toMatchObject({ ok: true, status: "running", round: 1 });
     expect(applyTransition({ status: "next", round: 1 }, "start", "claude", { canStart: { ok: true, reasons: [] } })).toMatchObject({ ok: true, status: "running", round: 2 });
+    expect(applyTransition({ status: "next", round: 2 }, "start", "claude", { canStart: { ok: true, reasons: [] } })).toMatchObject({ ok: true, status: "running", round: 3 });
+    expect(applyTransition({ status: "next", round: 3 }, "start", "claude", { canStart: { ok: true, reasons: [] } })).toMatchObject({ ok: false, error: { code: "max_rounds" } });
     expect(applyTransition({ status: "review", round: 1 }, "resume", "claude")).toMatchObject({ ok: true, status: "running", round: 2 });
     expect(applyTransition({ status: "review", round: 2 }, "resume", "claude")).toMatchObject({ ok: true, status: "running", round: 3 });
     expect(applyTransition({ status: "review", round: 3 }, "resume", "claude")).toMatchObject({ ok: false, error: { code: "max_rounds" } });

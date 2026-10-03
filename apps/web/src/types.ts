@@ -5,6 +5,8 @@ export interface EpicSummary {
   project: string;
   title: string;
   status: string;
+  merge_approved: boolean;
+  ready_for_merge: boolean;
   progress: { done: number; total: number };
 }
 
