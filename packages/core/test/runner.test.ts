@@ -15,6 +15,7 @@ import {
   listRunsForTask,
   listTaskLog,
   openStore,
+  setSetting,
   type BoardStore,
 } from "../src/store";
 import { changedFiles, ensureTaskWorktree, getEpicWorktreePath, getTaskWorktreePath, removeLeftoverWorktree, removeTaskWorktree } from "../src/worktrees";
@@ -363,6 +364,104 @@ describe("runner, worktrees, review, and agentctl", () => {
     const answer = cliJson<{ question: { answer: string }; task: { status: string } }>(["answer", asked.question.id, "Choose Option A"]);
     expect(answer.question.answer).toBe("Choose Option A");
     expect(answer.task.status).toBe("next");
+  });
+
+  test("continues the prior Codex session after an owner answer with a short decision note", async () => {
+    cliSetup();
+    cliJson(["task", "promote", "AB-1"]);
+    process.env.AGENT_BOARD_FAKE_EDIT = "nothing";
+    const first = cliJson<{ run_id: string }>(["start", "AB-1"]);
+    await waitForRun(first.run_id);
+    const asked = cliJson<{ question: { id: string } }>([
+      "ask", "AB-1", "--decision", "implementation", "--kind", "stop",
+      "--text", "Which implementation should be used?", "--option", "Option A", "--option", "Option B",
+      "--recommend", "Option A",
+    ]);
+    cliJson(["answer", asked.question.id, "Choose Option A"]);
+
+    const notePath = join(tempRoot, "owner-note.md");
+    writeFileSync(notePath, "Keep the selected approach narrow.", "utf8");
+    const continued = cliJson<{ run_id: string; round: number }>(["start", "AB-1", "--note", notePath]);
+    expect(continued.round).toBe(2);
+    await waitForRun(continued.run_id);
+    const prompt = await Bun.file(join(home, "runs", "AB-1", "2", "prompt.md")).text();
+    expect(prompt).toContain("implementation: Choose Option A");
+    expect(prompt).toContain("Keep the selected approach narrow.");
+    expect(prompt).not.toContain("## Task card");
+    const captured = await Bun.file(sessionCapture).text();
+    expect(captured).toContain(`resume:${fakeSession} exec resume ${fakeSession}`);
+    expect(getRun(store!, continued.run_id).resumeSessionId).toBe(fakeSession);
+    expect(listTaskLog(store!, "AB-1").filter(({ action }) => action === "start").at(-1)?.note)
+      .toBe(`continued session ${fakeSession}`);
+  });
+
+  test("--fresh starts a new Codex session and includes the card and all answered decisions", async () => {
+    cliSetup();
+    cliJson(["task", "promote", "AB-1"]);
+    process.env.AGENT_BOARD_FAKE_EDIT = "nothing";
+    const first = cliJson<{ run_id: string }>(["start", "AB-1"]);
+    await waitForRun(first.run_id);
+    const asked = cliJson<{ question: { id: string } }>([
+      "ask", "AB-1", "--decision", "implementation", "--kind", "stop",
+      "--text", "Which implementation should be used?", "--recommend", "Option A",
+    ]);
+    cliJson(["answer", asked.question.id, "Choose Option B"]);
+
+    const fresh = cliJson<{ run_id: string; round: number }>(["start", "AB-1", "--fresh"]);
+    expect(fresh.round).toBe(2);
+    await waitForRun(fresh.run_id);
+    const prompt = await Bun.file(join(home, "runs", "AB-1", "2", "prompt.md")).text();
+    expect(prompt).toContain("## Task card");
+    expect(prompt).toContain("implementation: Choose Option B");
+    expect(getRun(store!, fresh.run_id).resumeSessionId).toBeNull();
+    const captured = await Bun.file(sessionCapture).text();
+    expect(captured.match(/^exec /gm)).toHaveLength(2);
+    expect(captured).not.toContain("resume:");
+    expect(listTaskLog(store!, "AB-1").filter(({ action }) => action === "start").at(-1)?.note).toBe("started fresh");
+  });
+
+  test("continues the session after a rate-limit requeue with the interruption note", async () => {
+    cliSetup();
+    cliJson(["task", "promote", "AB-1"]);
+    process.env.AGENT_BOARD_FAKE_EDIT = "nothing";
+    process.env.AGENT_BOARD_FAKE_STDERR = "Rate limit exceeded";
+    process.env.AGENT_BOARD_FAKE_EXIT_CODE = "1";
+    const first = cliJson<{ run_id: string }>(["start", "AB-1"]);
+    expect((await waitForRun(first.run_id)).outcome).toBe("rate_limited");
+    expect(dispatchTick(store!).paused).toEqual([first.run_id]);
+    setSetting(store!, "paused_until", null);
+    delete process.env.AGENT_BOARD_FAKE_STDERR;
+    delete process.env.AGENT_BOARD_FAKE_EXIT_CODE;
+
+    const continued = cliJson<{ run_id: string; round: number }>(["start", "AB-1"]);
+    expect(continued.round).toBe(2);
+    await waitForRun(continued.run_id);
+    const prompt = await Bun.file(join(home, "runs", "AB-1", "2", "prompt.md")).text();
+    expect(prompt).toContain("the previous run was interrupted by a rate limit");
+    expect(prompt).not.toContain("## Task card");
+    expect((await Bun.file(sessionCapture).text())).toContain(`resume:${fakeSession} exec resume ${fakeSession}`);
+  });
+
+  test("refuses to start a fourth run", async () => {
+    cliSetup();
+    cliJson(["task", "promote", "AB-1"]);
+    process.env.AGENT_BOARD_FAKE_EDIT = "nothing";
+    for (let round = 1; round <= 3; round += 1) {
+      const started = cliJson<{ run_id: string; round: number }>(["start", "AB-1"]);
+      expect(started.round).toBe(round);
+      await waitForRun(started.run_id);
+      const asked = cliJson<{ question: { id: string } }>([
+        "ask", "AB-1", "--decision", "implementation", "--kind", "stop",
+        "--text", `Confirm implementation for run ${round}?`, "--recommend", "Continue",
+      ]);
+      cliJson(["answer", asked.question.id, `Continue after run ${round}`]);
+    }
+
+    const refused = cli(["start", "AB-1", "--json"]);
+    expect(refused.status).toBe(2);
+    expect(JSON.parse(refused.stdout)).toMatchObject({ details: { code: "max_rounds" } });
+    expect(getTask(store!, "AB-1")).toMatchObject({ status: "next", round: 3 });
+    expect(listRunsForTask(store!, "AB-1")).toHaveLength(3);
   });
 
   test("stores report assumptions as open non-blocking owner questions and records rejection", async () => {

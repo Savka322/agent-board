@@ -1,8 +1,8 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+﻿import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { addProject, addTask, appendEvents, closeStore, createEpic, createQuestion, createRun, emitBoardEvent, finishRun, openStore, renderCardFile, transitionTask, writeTaskLog, type BoardStore } from "@agent-board/core";
+import { addProject, addTask, appendEvents, closeStore, createEpic, createQuestion, createRun, emitBoardEvent, finishRun, listApprovals, listBoardEventsAfter, listRunsForTask, openStore, renderCardFile, transitionTask, writeTaskLog, type BoardStore } from "@agent-board/core";
 import type { TaskCard } from "@agent-board/contracts";
 import { createApp } from "../src/index";
 
@@ -53,11 +53,25 @@ function addSampleTask(id: string, options: Partial<TaskCard> = {}) {
   return addTask(store, epicId, path);
 }
 
-function app() {
-  return createApp(store, 8790);
+const TEST_TOKEN = "test-board-session-token";
+
+function app(options: { stopRunner?: (store: BoardStore, id: string) => unknown } = {}) {
+  return createApp(store, 8790, TEST_TOKEN, options);
 }
 
 const localHeaders = { Host: "127.0.0.1:8790" };
+
+function writeHeaders(token = TEST_TOKEN, origin = "http://127.0.0.1:8790") {
+  return { ...localHeaders, Origin: origin, "X-Board-Token": token };
+}
+
+function post(path: string, body?: unknown, headers: Record<string, string> = writeHeaders()) {
+  return app().request(`http://127.0.0.1:8790${path}`, {
+    method: "POST",
+    headers: { ...headers, ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+}
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "agent-board-server-test-"));
@@ -97,14 +111,14 @@ describe("read-only web app", () => {
     const response = await app().request("http://board/api/board", { headers: localHeaders });
     expect(response.status).toBe(200);
     const result = await response.json() as {
-      epics: Array<{ id: string; progress: { done: number; total: number } }>;
+      epics: Array<{ id: string; progress: { done: number; total: number }; merge_approved: boolean; ready_for_merge: boolean }>;
       tasks: Array<{ id: string; labels: string[] }>;
       questions: Array<{ id: string; held_task_ids: string[] }>;
       settings: { max_slots: number; paused_until: string | null };
       running_count: number;
       cursor: number;
     };
-    expect(result.epics).toEqual([{ id: epicId, project: "sample", title: "Web board", status: "open", progress: { done: 1, total: 4 } }]);
+    expect(result.epics).toEqual([{ id: epicId, project: "sample", title: "Web board", status: "open", progress: { done: 1, total: 4 }, merge_approved: false, ready_for_merge: false }]);
     expect(result.tasks.find((task) => task.id === blocked.id)?.labels).toEqual([`deps_pending:${pending.id}`]);
     expect(result.tasks.find((task) => task.id === questionTask.id)?.labels).toEqual([`waiting_answer:${question.id}`]);
     expect(result.questions[0]?.held_task_ids).toEqual([questionTask.id]);
@@ -218,5 +232,80 @@ describe("read-only web app", () => {
       if (timeout !== undefined) clearTimeout(timeout);
       await reader!.cancel();
     }
+  });
+});
+
+describe("protected owner write API", () => {
+  test("requires the session token and a same-origin header on every POST", async () => {
+    const paths = [
+      ["/api/questions/missing/answer", { text: "answer" }],
+      ["/api/tasks/missing/cancel", undefined],
+      ["/api/tasks/missing/prio", { prio: 1 }],
+      ["/api/epics/missing/approve-merge", undefined],
+    ] as const;
+    for (const [path, body] of paths) {
+      expect((await post(path, body, { ...localHeaders, Origin: "http://127.0.0.1:8790" })).status).toBe(403);
+      expect((await post(path, body, writeHeaders("wrong-token"))).status).toBe(403);
+      expect((await post(path, body, writeHeaders(TEST_TOKEN, "http://evil.example:8790"))).status).toBe(403);
+    }
+    expect((await post("/api/tasks/missing/prio", { prio: 1 }, writeHeaders(TEST_TOKEN, "http://localhost:8790"))).status).toBe(404);
+    const session = await app().request("http://127.0.0.1:8790/api/session", { headers: localHeaders });
+    expect(session.status).toBe(200);
+    expect(await session.json()).toMatchObject({ token: TEST_TOKEN, port: 8790 });
+    const generatedSession = await createApp(store, 8790).request("http://127.0.0.1:8790/api/session", { headers: localHeaders });
+    const generated = await generatedSession.json() as { token: string };
+    expect(generated.token).toMatch(/^[a-f\d]{64}$/);
+    expect(generatedSession.headers.get("access-control-allow-origin")).toBeNull();
+  });
+
+  test("answers stop questions, cancels through a fake runner, updates priority, and records web approval", async () => {
+    const ownerTask = addSampleTask("WEB-10", { decisions: ["release_mode"] });
+    transitionTask(store, ownerTask.id, "promote", "claude");
+    transitionTask(store, ownerTask.id, "start", "claude");
+    transitionTask(store, ownerTask.id, "run_finished", "runner");
+    transitionTask(store, ownerTask.id, "escalate", "claude");
+    const question = createQuestion(store, {
+      task: ownerTask.id, decision_key: "release_mode", kind: "stop", target: "owner",
+      text: "Choose release mode", options: ["automatic", "manual"], recommendation: "automatic",
+    });
+    const answered = await post(`/api/questions/${question.id}/answer`, { text: "automatic" });
+    expect(answered.status).toBe(200);
+    expect(await answered.json()).toMatchObject({ question: { status: "answered" }, task: { status: "next" } });
+    expect(listBoardEventsAfter(store, 0).some((event) => event.kind === "answer" && event.question === question.id)).toBe(true);
+
+    const runningTask = addSampleTask("WEB-11");
+    transitionTask(store, runningTask.id, "promote", "claude");
+    transitionTask(store, runningTask.id, "start", "claude");
+    const run = createRun(store, { id: "fake-running-run", task: runningTask.id, executor: "fake" });
+    const rejectedPriority = await post(`/api/tasks/${runningTask.id}/prio`, { prio: 4 });
+    expect(rejectedPriority.status).toBe(409);
+    expect(await rejectedPriority.json()).toMatchObject({ reason: expect.stringContaining("Priority can only change") });
+    let stopped = false;
+    const cancellationApp = createApp(store, 8790, TEST_TOKEN, {
+      stopRunner: (activeStore, id) => {
+        stopped = id === runningTask.id;
+        finishRun(activeStore, run.id, { outcome: "canceled", exitCode: 1 });
+        transitionTask(activeStore, id, "run_finished", "runner");
+      },
+    });
+    const canceled = await cancellationApp.request(`http://127.0.0.1:8790/api/tasks/${runningTask.id}/cancel`, { method: "POST", headers: writeHeaders() });
+    expect(canceled.status).toBe(200);
+    expect(stopped).toBe(true);
+    expect(JSON.parse(JSON.stringify(await canceled.json()))).toMatchObject({ status: "canceled" });
+
+    const priorityTask = addSampleTask("WEB-12");
+    const priority = await post(`/api/tasks/${priorityTask.id}/prio`, { prio: -3 });
+    expect(priority.status).toBe(200);
+    expect(await priority.json()).toMatchObject({ id: priorityTask.id, prio: -3 });
+
+    const openEpic = await post(`/api/epics/${epicId}/approve-merge`);
+    expect(openEpic.status).toBe(409);
+    expect(await openEpic.json()).toMatchObject({ reason: expect.stringContaining("every task must be done or canceled") });
+
+    transitionTask(store, ownerTask.id, "cancel", "owner");
+    transitionTask(store, priorityTask.id, "cancel", "owner");
+    const approved = await post(`/api/epics/${epicId}/approve-merge`);
+    expect(approved.status).toBe(200);
+    expect(listApprovals(store, epicId)).toMatchObject([{ epic: epicId, kind: "merge", source: "web" }]);
   });
 });

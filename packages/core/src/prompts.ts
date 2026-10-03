@@ -58,3 +58,18 @@ export function buildResumePrompt(note: string, decisions: PromptDecision[]): st
   if (decisions.length > 0) sections.push(`## New answered decisions\n${decisionsText(decisions)}`);
   return `${sections.join("\n\n")}\n`;
 }
+
+export function buildContinuationPrompt(input: {
+  decisions: PromptDecision[];
+  rateLimited: boolean;
+  note?: string;
+}): string {
+  const update = input.rateLimited
+    ? "the previous run was interrupted by a rate limit"
+    : input.decisions.length > 0
+      ? decisionsText(input.decisions)
+      : "No decisions have been answered since the previous run.";
+  const sections = [`## Board update\n${update}`];
+  if (input.note !== undefined) sections.push(`## Additional note\n${input.note}`);
+  return `${sections.join("\n\n")}\n`;
+}

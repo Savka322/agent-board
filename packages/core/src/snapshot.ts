@@ -7,6 +7,7 @@ import {
   getBoardEventCursor,
   getSetting,
   getTask,
+  hasApproval,
   listEventsAfter,
   listEpics,
   listOpenQuestionsForTask,
@@ -121,6 +122,8 @@ export function boardSnapshot(store: BoardStore, options: BoardSnapshotOptions =
         project: item.project,
         title: item.title,
         status: item.status,
+        merge_approved: hasApproval(store, item.id, "merge"),
+        ready_for_merge: epicTasks.length > 0 && epicTasks.every((task) => task.status === "done" || task.status === "canceled"),
         progress: { done: epicTasks.filter((task) => task.status === "done").length, total: epicTasks.length },
       };
     }),

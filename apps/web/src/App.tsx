@@ -15,6 +15,21 @@ async function fetchJson<T>(url: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+async function postJson<T>(url: string, token: string, body?: unknown): Promise<T> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "X-Board-Token": token,
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const value = await response.json() as T & { error?: string; reason?: string };
+  if (!response.ok) throw new Error(value.reason ?? value.error ?? `Request failed with status ${response.status}`);
+  return value;
+}
+
 function useTheme() {
   const [manualTheme, setManualTheme] = useState<Theme | null>(() => {
     const stored = localStorage.getItem("agent-board-theme");
@@ -44,7 +59,7 @@ function eventCursor(events: TaskEvent[]): number {
   return events.reduce((cursor, event) => Math.max(cursor, event.seq), -1);
 }
 
-function Panel({ selection, questions, onClose }: { selection: PanelSelection; questions: OwnerQuestion[]; onClose: () => void }) {
+function Panel({ selection, questions, token, onClose, onRefresh, onQuestionAnswered }: { selection: PanelSelection; questions: OwnerQuestion[]; token: string | null; onClose: () => void; onRefresh: () => void; onQuestionAnswered: (id: string) => void }) {
   const { t, i18n: currentI18n } = useTranslation();
   const queryClient = useQueryClient();
   const taskId = selection?.type === "task" ? selection.id : null;
@@ -152,6 +167,8 @@ function Panel({ selection, questions, onClose }: { selection: PanelSelection; q
             : detailQuery.isError ? <p className="inline-error">{t("loadError")}</p>
               : detailQuery.data ? <TaskPanel
                 detail={detailQuery.data}
+                token={token}
+                onRefresh={onRefresh}
                 events={events}
                 eventsLoading={eventsLoading}
                 eventsError={eventsError}
@@ -162,7 +179,7 @@ function Panel({ selection, questions, onClose }: { selection: PanelSelection; q
               /> : null
         )}
 
-        {selection.type === "question" && question && <QuestionPanel question={question} code={questionCode(question, questions, t)} />}
+        {selection.type === "question" && question && <QuestionPanel question={question} code={questionCode(question, questions, t)} token={token} onAnswered={() => onQuestionAnswered(question.id)} />}
         {selection.type === "question" && !question && <p className="empty-inline">{t("noQuestions")}</p>}
       </aside>
     </div>
@@ -186,6 +203,8 @@ function formatDate(value: string | null, locale: string): string {
 
 function TaskPanel({
   detail,
+  token,
+  onRefresh,
   events,
   eventsLoading,
   eventsError,
@@ -195,6 +214,8 @@ function TaskPanel({
   locale,
 }: {
   detail: TaskDetailData;
+  token: string | null;
+  onRefresh: () => void;
   events: TaskEvent[];
   eventsLoading: boolean;
   eventsError: boolean;
@@ -205,6 +226,36 @@ function TaskPanel({
 }) {
   const { t } = useTranslation();
   const { card } = detail;
+  const [cancelConfirm, setCancelConfirm] = useState(false);
+  const [actionError, setActionError] = useState("");
+  const [actionBusy, setActionBusy] = useState(false);
+  const changePriority = async (delta: number) => {
+    if (!token) return;
+    setActionBusy(true);
+    setActionError("");
+    try {
+      await postJson(`/api/tasks/${encodeURIComponent(card.id)}/prio`, token, { prio: card.prio + delta });
+      onRefresh();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setActionBusy(false);
+    }
+  };
+  const cancel = async () => {
+    if (!token) return;
+    setActionBusy(true);
+    setActionError("");
+    try {
+      await postJson(`/api/tasks/${encodeURIComponent(card.id)}/cancel`, token);
+      setCancelConfirm(false);
+      onRefresh();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setActionBusy(false);
+    }
+  };
   return (
     <div className="panel-content">
       <div className="task-detail-heading">
@@ -214,6 +265,21 @@ function TaskPanel({
           {card.round > 0 && <span className="round-tag">{t("round", { n: card.round })}</span>}
         </div>
       </div>
+
+      {(card.status === "todo" || card.status === "next" || card.status === "running") && <section className="detail-section owner-actions">
+        <h4>{t("ownerActions")}</h4>
+        {(card.status === "todo" || card.status === "next") && <div className="action-button-row">
+          <button className="secondary-button" type="button" disabled={!token || actionBusy} onClick={() => void changePriority(-1)}>{t("prioUp")}</button>
+          <button className="secondary-button" type="button" disabled={!token || actionBusy} onClick={() => void changePriority(1)}>{t("prioDown")}</button>
+        </div>}
+        {!cancelConfirm
+          ? <button className="danger-button" type="button" disabled={!token || actionBusy} onClick={() => setCancelConfirm(true)}>{t("cancelTask")}</button>
+          : <div className="confirm-action"><p>{t("confirmCancelTask")}</p><div className="action-button-row">
+            <button className="danger-button" type="button" disabled={actionBusy} onClick={() => void cancel()}>{t("confirmCancel")}</button>
+            <button className="secondary-button" type="button" disabled={actionBusy} onClick={() => setCancelConfirm(false)}>{t("keepTask")}</button>
+          </div></div>}
+        {actionError && <p className="inline-error" role="alert">{actionError}</p>}
+      </section>}
 
       <section className="detail-section">
         <h4>{t("goal")}</h4>
@@ -322,14 +388,11 @@ function ReviewView({ review }: { review: NonNullable<TaskDetailData["review_sum
   </div>;
 }
 
-function QuestionPanel({ question, code }: { question: OwnerQuestion; code: string }) {
+function QuestionPanel({ question, code, token, onAnswered }: { question: OwnerQuestion; code: string; token: string | null; onAnswered: () => void }) {
   const { t } = useTranslation();
   return <div className="panel-content question-panel-content">
-    <span className="question-code">{code}</span>
-    <p className="question-text">{question.text}</p>
     {question.decision_key && <p className="decision-key"><code>{question.decision_key}</code></p>}
-    {question.options.length > 0 && <section className="detail-section"><h4>{t("options")}</h4><ul className="plain-list">{question.options.map((option, index) => <li key={`${index}-${option}`}>{option}</li>)}</ul></section>}
-    <section className="detail-section recommendation"><h4>{t("recommendation")}</h4><p>{question.recommendation}</p></section>
+    <QuestionCard question={question} code={code} token={token} highlighted={false} onAnswered={onAnswered} />
     <section className="detail-section"><h4>{t("heldTasks")}</h4>{question.held_task_ids.length > 0
       ? <ul className="code-list">{question.held_task_ids.map((id) => <li key={id}><code>{id}</code></li>)}</ul>
       : <p className="empty-inline">{t("noTasksHeld")}</p>}</section>
@@ -360,15 +423,55 @@ function TaskCard({ task, questionCodes, onClick }: { task: TaskSummary; questio
   </button>;
 }
 
-function QuestionCard({ question, code, onClick }: { question: OwnerQuestion; code: string; onClick: () => void }) {
+function QuestionCard({ question, code, token, highlighted, onOpen, onAnswered }: { question: OwnerQuestion; code: string; token: string | null; highlighted: boolean; onOpen?: () => void; onAnswered: () => void }) {
   const { t } = useTranslation();
-  return <button className="question-card" type="button" onClick={onClick} aria-label={`${code} ${question.text}`}>
+  const [answer, setAnswer] = useState("");
+  const [choice, setChoice] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async (reject: boolean) => {
+    const text = (choice || answer).trim();
+    if (!text) {
+      setError(t("answerRequired"));
+      return;
+    }
+    if (!token) {
+      setError(t("writeUnavailable"));
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await postJson(`/api/questions/${encodeURIComponent(question.id)}/answer`, token, { text, ...(reject ? { reject: true } : {}) });
+      onAnswered();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return <article className={`question-card${highlighted ? " question-highlighted" : ""}`} aria-label={`${code} ${question.text}`}>
     <div className="question-card-top"><span className="question-code">{code}</span><span className="question-marker">{t("question")}</span></div>
-    <span className="question-card-text">{question.text}</span>
-    {question.options.length > 0 && <span className="question-options"><b>{t("options")}:</b> {question.options.join(" · ")}</span>}
-    {question.recommendation && <span className="question-recommendation">{t("recommendation")}: {question.recommendation}</span>}
+    <p className="question-card-text">{question.text}</p>
     <span className="holds-tag">{t("holds", { count: question.held_task_ids.length })}</span>
-  </button>;
+    {question.options.length > 0 && <fieldset className="answer-options"><legend>{t("options")}</legend>
+      {question.options.map((option) => <label className="answer-option" key={option}>
+        <input type="radio" name={`answer-${question.id}`} value={option} checked={choice === option} onChange={() => { setChoice(option); setError(""); }} />
+        <span>{option}</span>{option === question.recommendation && <em>{t("recommended")}</em>}
+      </label>)}
+    </fieldset>}
+    {question.recommendation && <p className="question-recommendation">{t("recommendation")}: {question.recommendation}</p>}
+    <label className="answer-input-label">{t("yourAnswer")}
+      <textarea value={answer} onChange={(event) => { setAnswer(event.target.value); setChoice(""); setError(""); }} rows={2} />
+    </label>
+    {error && <p className="inline-error answer-error" role="alert">{error}</p>}
+    <div className="answer-actions">
+      {question.kind === "assume"
+        ? <><button className="primary-button" type="button" disabled={busy} onClick={() => void submit(false)}>{t("confirmAnswer")}</button><button className="secondary-button" type="button" disabled={busy} onClick={() => void submit(true)}>{t("rejectAnswer")}</button></>
+        : <button className="primary-button" type="button" disabled={busy} onClick={() => void submit(false)}>{t("sendAnswer")}</button>}
+      {onOpen && <button className="text-button" type="button" onClick={onOpen}>{t("openDetails")}</button>}
+    </div>
+  </article>;
 }
 
 export function App() {
@@ -378,12 +481,27 @@ export function App() {
   const [selection, setSelection] = useState<PanelSelection>(null);
   const [pollFallback, setPollFallback] = useState(false);
   const { theme, toggle: toggleTheme } = useTheme();
+  const sessionQuery = useQuery({ queryKey: ["session"], queryFn: () => fetchJson<{ token: string; port: number }>("/api/session") });
+  const token = sessionQuery.data?.token ?? null;
   const boardQuery = useQuery({
     queryKey: ["board", epic],
     queryFn: () => fetchJson<BoardData>(`/api/board${epic ? `?epic=${encodeURIComponent(epic)}` : ""}`),
     refetchInterval: pollFallback ? 2000 : false,
   });
   const board = boardQuery.data;
+
+  useEffect(() => {
+    const applyHash = () => {
+      const params = new URLSearchParams(window.location.hash.slice(1));
+      const question = params.get("q");
+      const epicId = params.get("epic");
+      if (question) setSelection({ type: "question", id: question });
+      if (epicId) setEpic(epicId);
+    };
+    applyHash();
+    window.addEventListener("hashchange", applyHash);
+    return () => window.removeEventListener("hashchange", applyHash);
+  }, []);
 
   useEffect(() => {
     if (!board) return;
@@ -415,10 +533,18 @@ export function App() {
   const questionCards = board?.questions ?? [];
   const isWaitingForOwner = questionCards.length > 0 && board?.running_count === 0;
   const pauseUntil = board?.settings.paused_until ?? null;
+  const currentEpic = board?.epics.find((item) => item.id === epic);
   const isPaused = pauseUntil !== null && Date.parse(pauseUntil) > Date.now();
 
   const toggleLanguage = () => {
     void i18n.changeLanguage(i18n.language.toLowerCase().startsWith("ru") ? "en" : "ru");
+  };
+
+  const handleQuestionAnswered = (questionId: string) => {
+    void queryClient.invalidateQueries({ queryKey: ["board"] });
+    const hash = new URLSearchParams(window.location.hash.slice(1));
+    if (hash.get("q") === questionId) window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+    if (selection?.type === "question" && selection.id === questionId) setSelection(null);
   };
 
   return (
@@ -427,7 +553,7 @@ export function App() {
         <div className="masthead">
           <div className="brand-mark" aria-hidden="true">AB</div>
           <div className="brand-copy"><h1>{t("appName")}</h1><span>{t("localOnly")}</span></div>
-          <span className="read-only-tag">{t("readOnly")}</span>
+          {!token && <span className="read-only-tag">{t("readOnly")}</span>}
           <div className="header-actions">
             <button className="header-button language-button" type="button" onClick={toggleLanguage} aria-label={t("switchLanguage")}>{i18n.language.toLowerCase().startsWith("ru") ? "EN" : "RU"}</button>
             <button className="header-button theme-button" type="button" onClick={toggleTheme} aria-label={t(theme === "dark" ? "switchToLight" : "switchToDark")} title={t("theme")}>
@@ -450,6 +576,12 @@ export function App() {
             </div>
           </div>
           <div className="slot-counter"><span className="slot-dot" /><span>{t("slots")}</span><strong>{board.running_count}<small> / {board.settings.max_slots}</small></strong></div>
+          {currentEpic?.ready_for_merge && !currentEpic.merge_approved && <button className="primary-button approve-merge-button" type="button" disabled={!token} onClick={async () => {
+            if (!token) return;
+            try { await postJson(`/api/epics/${encodeURIComponent(currentEpic.id)}/approve-merge`, token); await queryClient.invalidateQueries({ queryKey: ["board"] }); }
+            catch (error) { window.alert(error instanceof Error ? error.message : String(error)); }
+          }}>{t("approveMerge")}</button>}
+          {currentEpic?.merge_approved && <span className="approved-note">{t("approvedWaiting")}</span>}
         </div>}
       </header>
 
@@ -475,7 +607,7 @@ export function App() {
                 </header>
                 <div className="column-subtitle">{t("tasksCount", { count: tasks.length })}{questions.length > 0 && <span> · {t("questionsCount", { count: questions.length })}</span>}</div>
                 <div className="column-cards">
-                  {status === "needs_owner" && questions.map((question, index) => <QuestionCard key={question.id} question={question} code={t("questionCode", { n: index + 1 })} onClick={() => setSelection({ type: "question", id: question.id })} />)}
+                  {status === "needs_owner" && questions.map((question, index) => <QuestionCard key={question.id} question={question} token={token} highlighted={selection?.type === "question" && selection.id === question.id} code={t("questionCode", { n: index + 1 })} onOpen={() => { window.location.hash = `q=${encodeURIComponent(question.id)}`; setSelection({ type: "question", id: question.id }); }} onAnswered={() => handleQuestionAnswered(question.id)} />)}
                   {tasks.map((task) => <TaskCard key={task.id} task={task} questionCodes={questionCodes} onClick={() => setSelection({ type: "task", id: task.id })} />)}
                   {tasks.length === 0 && questions.length === 0 && <p className="column-empty">{t(status === "needs_owner" ? "noQuestions" : "noTasks")}</p>}
                 </div>
@@ -485,8 +617,8 @@ export function App() {
         </div>
       </>}
 
-      <footer className="app-footer"><span>{t("appName")}</span><span>{t("readOnly")}</span></footer>
-      <Panel selection={selection} questions={questionCards} onClose={() => setSelection(null)} />
+      <footer className="app-footer"><span>{t("appName")}</span>{!token && <span>{t("readOnly")}</span>}</footer>
+      <Panel selection={selection} questions={questionCards} token={token} onRefresh={() => { void queryClient.invalidateQueries({ queryKey: ["board"] }); if (selection?.type === "task") void queryClient.invalidateQueries({ queryKey: ["task", selection.id] }); }} onQuestionAnswered={handleQuestionAnswered} onClose={() => setSelection(null)} />
     </main>
   );
 }

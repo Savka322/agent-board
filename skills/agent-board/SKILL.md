@@ -16,7 +16,7 @@ All state lives in the board. Change it **only** through `agentctl`; never edit 
 - Never trust an executor's "tests passed". Read the whole diff and run the gates yourself (`agentctl gate`).
 - Never merge into the project's base branch without the owner's approval on the board. `agentctl epic merge` enforces it; do not work around it.
 - Never touch the profile's `forbidden` files, never push, never change the client repo's config or hooks.
-- At most 3 rounds per task (start + 2 resumes). After that, re-cut the card or fix it yourself.
+- At most 3 runs per task, including starts after an owner answer or rate-limit requeue. After that, re-cut the card or fix it yourself.
 - Report to the owner in the owner's language.
 
 ## Before you start
@@ -61,9 +61,9 @@ Keep the returned `cursor` and pass it back next time; then no event is lost. Ex
 
 | Event | What you do |
 |---|---|
-| `ready` | Re-read the card against newly answered decisions; fix the card file if needed. Then `agentctl start <ID>`. Exit 2 = refused: read the reasons (`deps_pending`, `waiting_answer`, `no_slot`, `file_overlap`, `no_memory`, `paused`) |
+| `ready` | Re-read the card against newly answered decisions; fix the card file if needed. Then `agentctl start <ID>`. Exit 2 = refused: read the reasons (`deps_pending`, `waiting_answer`, `no_slot`, `file_overlap`, `no_memory`, `paused`, `max_rounds`) |
 | `review` | Review (section 3). The payload carries the run outcome: `done`, `partial`, `blocked`, `failed`, `canceled`, `rate_limited` |
-| `answer` | The owner answered. Check the answer does not contradict other cards, then `agentctl resume <ID> --note <file>` (or `start` if the task never ran) |
+| `answer` | The owner answered. Check the answer does not contradict other cards, then `agentctl start <ID>` continues the executor's session; `--fresh` starts over |
 | `assumption_rejected` | Task still in `review` → resume with the correction. Already `done` → cut a follow-up task |
 | `stale` | `agentctl log <ID>`. Really stuck → `agentctl stop <ID>`, then resume with a note |
 | `failed` | Read `runs/<ID>/<round>/stderr.log`. Infrastructure → resume. Card problem → `reject`, fix the card, start again |

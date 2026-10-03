@@ -89,6 +89,7 @@ export const runs = sqliteTable("runs", {
   round: integer("round").notNull(),
   executor: text("executor").notNull(),
   sessionId: text("session_id"),
+  resumeSessionId: text("resume_session_id"),
   pid: integer("pid"),
   startedAt: text("started_at").notNull(),
   endedAt: text("ended_at"),
@@ -151,11 +152,31 @@ export const approvals = sqliteTable("approvals", {
   createdAt: text("created_at").notNull(),
 });
 
+export const epicLog = sqliteTable("epic_log", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  epic: text("epic").notNull().references(() => epics.id),
+  ts: text("ts").notNull(),
+  actor: text("actor").notNull(),
+  action: text("action").notNull(),
+  note: text("note"),
+});
+
+export const notifications = sqliteTable("notifications", {
+  id: text("id").primaryKey(),
+  ts: text("ts").notNull(),
+  kind: text("kind").notNull(),
+  ref: text("ref").notNull(),
+  appId: text("app_id").notNull(),
+  delivered: integer("delivered", { mode: "boolean" }).notNull(),
+  error: text("error"),
+}, (table) => [index("notifications_cause_idx").on(table.kind, table.ref)]);
+
 export const boardEvents = sqliteTable("board_events", {
   seq: integer("seq").primaryKey({ autoIncrement: true }),
   ts: text("ts").notNull(),
   kind: text("kind").notNull(),
   task: text("task"),
+  epic: text("epic"),
   question: text("question"),
   run: text("run"),
   payload: text("payload").notNull(),
@@ -184,6 +205,8 @@ export const schema = {
   gateStats,
   memoryLeases,
   approvals,
+  epicLog,
+  notifications,
   boardEvents,
   settings,
 };

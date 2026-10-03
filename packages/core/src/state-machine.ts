@@ -147,14 +147,15 @@ export function applyTransition(
   if (action === "requeue" && ctx.lastRunOutcome !== "rate_limited") {
     return { ok: false, error: { code: "requeue_requires_rate_limited" } };
   }
+  if ((action === "start" || action === "resume") && task.round >= 3) {
+    return { ok: false, error: { code: "max_rounds" } };
+  }
   if (action === "start" && ctx.canStart?.ok !== true) {
     return {
       ok: false,
       error: { code: "start_blocked", ...(ctx.canStart ? { reasons: ctx.canStart.reasons } : {}) },
     };
   }
-  if (action === "resume" && task.round >= 3) return { ok: false, error: { code: "max_rounds" } };
-
   let round = task.round;
   if (action === "start") round = task.round === 0 ? 1 : task.round + 1;
   if (action === "resume") round += 1;
