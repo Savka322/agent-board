@@ -1,10 +1,12 @@
 import {
+  check,
   integer,
   index,
   primaryKey,
   sqliteTable,
   text,
 } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
 
 export const projects = sqliteTable("projects", {
   name: text("name").primaryKey(),
@@ -110,6 +112,7 @@ export const gateRuns = sqliteTable("gate_runs", {
   task: text("task").notNull().references(() => tasks.id),
   cmd: text("cmd").notNull(),
   status: text("status").notNull(),
+  exitCode: integer("exit_code"),
   ramEstBytes: integer("ram_est_bytes").notNull(),
   peakCommitBytes: integer("peak_commit_bytes"),
   startedAt: text("started_at"),
@@ -122,6 +125,19 @@ export const gateStats = sqliteTable("gate_stats", {
   peakCommitMaxBytes: integer("peak_commit_max_bytes").notNull(),
   runs: integer("runs").notNull(),
 }, (table) => [primaryKey({ columns: [table.project, table.cmdHash] })]);
+
+export const memoryLeases = sqliteTable("memory_leases", {
+  id: text("id").primaryKey(),
+  kind: text("kind").notNull(),
+  ref: text("ref").notNull(),
+  bytes: integer("bytes").notNull(),
+  pid: integer("pid"),
+  createdAt: text("created_at").notNull(),
+}, (table) => [
+  index("memory_leases_pid_idx").on(table.pid),
+  check("memory_leases_kind_check", sql`${table.kind} IN ('gate', 'executor')`),
+  check("memory_leases_bytes_check", sql`${table.bytes} > 0`),
+]);
 
 export const approvals = sqliteTable("approvals", {
   id: text("id").primaryKey(),
@@ -162,6 +178,7 @@ export const schema = {
   events,
   gateRuns,
   gateStats,
+  memoryLeases,
   approvals,
   boardEvents,
   settings,
