@@ -4,6 +4,8 @@ export interface ResourceLimitSession {
   peakMemoryBytes(): number | null;
   /** Non-blocking check for the job memory-limit completion-port notification. */
   pollMemoryLimit(): boolean;
+  /** Drain all currently queued job completion-port message identifiers. */
+  pollMessages(): number[];
   dispose(): void;
 }
 

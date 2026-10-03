@@ -818,10 +818,14 @@ export interface CreateGateRunInput {
   task: string;
   cmd: string;
   ram_est_bytes: number;
+  attempt?: number;
+  retry_of?: string | null;
 }
 
 export function createGateRun(store: BoardStore, input: CreateGateRunInput) {
   if (!Number.isInteger(input.ram_est_bytes) || input.ram_est_bytes < 0) throw new TypeError("ram_est_bytes must be a non-negative integer");
+  const attempt = input.attempt ?? 1;
+  if (!Number.isInteger(attempt) || attempt < 1) throw new TypeError("attempt must be a positive integer");
   const row = {
     id: input.id ?? crypto.randomUUID(),
     task: input.task,
@@ -829,6 +833,9 @@ export function createGateRun(store: BoardStore, input: CreateGateRunInput) {
     status: "queued",
     exitCode: null,
     ramEstBytes: input.ram_est_bytes,
+    attempt,
+    retryOf: input.retry_of ?? null,
+    leaseBytes: null,
     peakCommitBytes: null,
     startedAt: null,
     endedAt: null,
@@ -840,6 +847,7 @@ export function createGateRun(store: BoardStore, input: CreateGateRunInput) {
 export interface UpdateGateRunInput {
   status: GateStatus;
   exit_code?: number | null;
+  lease_bytes?: number | null;
   peak_commit_bytes?: number | null;
   started_at?: string | null;
   ended_at?: string | null;
@@ -854,11 +862,16 @@ export function updateGateRun(store: BoardStore, id: string, input: UpdateGateRu
     && (!Number.isInteger(input.peak_commit_bytes) || input.peak_commit_bytes < 0)) {
     throw new TypeError("peak_commit_bytes must be a non-negative integer");
   }
+  if (input.lease_bytes !== undefined && input.lease_bytes !== null
+    && (!Number.isInteger(input.lease_bytes) || input.lease_bytes <= 0)) {
+    throw new TypeError("lease_bytes must be a positive integer");
+  }
   const current = store.db.select().from(gateRuns).where(eq(gateRuns.id, id)).get();
   if (!current) throw new StoreNotFoundError("Gate run", id);
   const update = {
     status,
     ...(input.exit_code !== undefined ? { exitCode: input.exit_code } : {}),
+    ...(input.lease_bytes !== undefined ? { leaseBytes: input.lease_bytes } : {}),
     ...(input.peak_commit_bytes !== undefined ? { peakCommitBytes: input.peak_commit_bytes } : {}),
     ...(input.started_at !== undefined ? { startedAt: input.started_at } : {}),
     ...(input.ended_at !== undefined ? { endedAt: input.ended_at } : {}),

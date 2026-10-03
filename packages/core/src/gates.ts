@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { closeSync, mkdirSync, openSync, writeSync, createWriteStream } from "node:fs";
+import { closeSync, fstatSync, mkdirSync, openSync, readSync, writeSync, createWriteStream } from "node:fs";
 import { spawn } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,7 +11,6 @@ import {
   getGateRun,
   getProject,
   getTask,
-  listGateRunsForTask,
   openStore,
   updateGateRun,
   updateGateStats,
@@ -32,6 +31,32 @@ import { isProcessAlive } from "./dispatcher";
 import { getTaskWorktreePath, ensureTaskWorktree } from "./worktrees";
 
 const now = (): string => new Date().toISOString();
+const ACTIVE_PROCESS_ZERO = 4;
+
+const stderrOomPatterns = [
+  { label: "RangeError: Out of memory", pattern: /RangeError:\s*Out of memory/i },
+  { label: "MemoryError", pattern: /MemoryError/i },
+  { label: "std::bad_alloc", pattern: /std::bad_alloc/i },
+  { label: "Out of memory", pattern: /Out of memory/i },
+  { label: "Bun crash banner", pattern: /oh no: Bun has crashed\. This indicates a bug in Bun, not your code\./i },
+];
+
+function matchStderrOomPattern(stderr: string): string | undefined {
+  return stderrOomPatterns.find(({ pattern }) => pattern.test(stderr))?.label;
+}
+
+function readGateLogTail(path: string): string {
+  const descriptor = openSync(path, "r");
+  try {
+    const size = fstatSync(descriptor).size;
+    const length = Math.min(size, 8192);
+    const tail = Buffer.alloc(length);
+    readSync(descriptor, tail, 0, length, size - length);
+    return tail.toString("utf8");
+  } finally {
+    closeSync(descriptor);
+  }
+}
 
 function commandHash(command: string): string {
   return createHash("sha256").update(command, "utf8").digest("hex");
@@ -60,6 +85,21 @@ export interface GateRunSummary {
   cmd: string;
   status: string;
   exit_code: number | null;
+  lease_bytes: number | null;
+  peak_commit_bytes: number | null;
+  started_at: string | null;
+  ended_at: string | null;
+  log_path: string;
+  attempts: GateAttemptSummary[];
+}
+
+export interface GateAttemptSummary {
+  id: string;
+  attempt: number;
+  retry_of: string | null;
+  status: string;
+  exit_code: number | null;
+  lease_bytes: number | null;
   peak_commit_bytes: number | null;
   started_at: string | null;
   ended_at: string | null;
@@ -68,12 +108,14 @@ export interface GateRunSummary {
 
 interface PlannedGate {
   id: string;
+  currentAttemptId: string;
+  attemptIds: string[];
+  attempt: number;
   task: string;
   project: string;
   cmd: string;
   estimateBytes: number;
   leaseBytes: number;
-  attempts: number;
   exclusiveRetry: boolean;
   lastWait?: string;
 }
@@ -109,18 +151,39 @@ function waitingReason(requested: number, free: number): string {
   return `needs ${mb(requested)} MB; ${mb(free)} MB free`;
 }
 
-function summaries(store: BoardStore, taskId: string): GateRunSummary[] {
-  return listGateRunsForTask(store, taskId).map((run) => ({
-    id: run.id,
-    task: run.task,
-    cmd: run.cmd,
-    status: run.status,
-    exit_code: run.exitCode,
-    peak_commit_bytes: run.peakCommitBytes,
-    started_at: run.startedAt,
-    ended_at: run.endedAt,
-    log_path: gateLogPath(store, run.task, run.id),
-  }));
+function summaries(store: BoardStore, planned: PlannedGate[]): GateRunSummary[] {
+  return planned.map((gate) => {
+    const attempts = gate.attemptIds
+      .map((id) => getGateRun(store, id))
+      .sort((left, right) => left.attempt - right.attempt)
+      .map((run) => ({
+        id: run.id,
+        attempt: run.attempt,
+        retry_of: run.retryOf,
+        status: run.status,
+        exit_code: run.exitCode,
+        lease_bytes: run.leaseBytes,
+        peak_commit_bytes: run.peakCommitBytes,
+        started_at: run.startedAt,
+        ended_at: run.endedAt,
+        log_path: gateLogPath(store, run.task, run.id),
+      }));
+    const finalAttempt = attempts[attempts.length - 1]!;
+    const firstAttempt = attempts[0]!;
+    return {
+      id: gate.id,
+      task: gate.task,
+      cmd: gate.cmd,
+      status: finalAttempt.status,
+      exit_code: finalAttempt.exit_code,
+      lease_bytes: finalAttempt.lease_bytes,
+      peak_commit_bytes: finalAttempt.peak_commit_bytes,
+      started_at: firstAttempt.started_at,
+      ended_at: finalAttempt.ended_at,
+      log_path: finalAttempt.log_path,
+      attempts,
+    };
+  });
 }
 
 /** Start task gates whenever the cross-process ledger has room, retrying one OOM with the full limit. */
@@ -136,15 +199,17 @@ export async function runGates(
   const limit = memoryLimitBytes(store);
   const planned: PlannedGate[] = gates.map((gate) => {
     const estimateBytes = gateEstimateBytes(store, projectName, gate);
-    const run = createGateRun(store, { task: taskId, cmd: gate.cmd, ram_est_bytes: estimateBytes });
+    const run = createGateRun(store, { task: taskId, cmd: gate.cmd, ram_est_bytes: estimateBytes, attempt: 1 });
     return {
       id: run.id,
+      currentAttemptId: run.id,
+      attemptIds: [run.id],
+      attempt: 1,
       task: taskId,
       project: projectName,
       cmd: gate.cmd,
       estimateBytes,
       leaseBytes: gateLeaseBytes(estimateBytes, limit),
-      attempts: 0,
       exclusiveRetry: false,
     };
   });
@@ -158,10 +223,11 @@ export async function runGates(
   while (completed.size < planned.length) {
     for (const gate of [...queued]) {
       const requestedBytes = gate.exclusiveRetry ? limit : gate.leaseBytes;
+      const attemptId = gate.currentAttemptId;
       const acquisition = tryAcquireMemoryLease(store, {
-        id: gate.id,
+        id: attemptId,
         kind: "gate",
-        ref: gate.id,
+        ref: attemptId,
         bytes: requestedBytes,
       });
       if (!acquisition.acquired) {
@@ -174,18 +240,17 @@ export async function runGates(
       }
 
       queued.splice(queued.indexOf(gate), 1);
-      gate.attempts += 1;
       gate.lastWait = undefined;
-      const startedAt = getGateRun(store, gate.id).startedAt ?? now();
-      updateGateRun(store, gate.id, { status: "running", started_at: startedAt, ended_at: null });
+      const startedAt = getGateRun(store, attemptId).startedAt ?? now();
+      updateGateRun(store, attemptId, { status: "running", lease_bytes: requestedBytes, started_at: startedAt, ended_at: null });
       try {
-        const pid = spawnGateLauncher(gate.id, gateLogPath(store, gate.task, gate.id));
-        if (pid !== undefined) setMemoryLeasePid(store, gate.id, pid);
-        active.set(gate.id, { gate, pid });
+        const pid = spawnGateLauncher(attemptId, gateLogPath(store, gate.task, attemptId));
+        if (pid !== undefined) setMemoryLeasePid(store, attemptId, pid);
+        active.set(attemptId, { gate, pid });
       } catch (error) {
-        releaseMemoryLease(store, gate.id);
-        updateGateRun(store, gate.id, { status: "fail", exit_code: 1, ended_at: now() });
-        writeGateLauncherError(store, gate.id, error);
+        releaseMemoryLease(store, attemptId);
+        updateGateRun(store, attemptId, { status: "fail", exit_code: 1, ended_at: now() });
+        writeGateLauncherError(store, attemptId, error);
         completed.add(gate.id);
       }
     }
@@ -196,30 +261,53 @@ export async function runGates(
         if (entry.pid !== undefined && isProcessAlive(entry.pid)) continue;
         active.delete(id);
         releaseMemoryLease(store, id);
-        if (run.status === "oom" && entry.gate.attempts === 1) {
+        if (run.status === "oom" && run.endedAt === null) {
+          const endedAt = now();
+          updateGateRun(store, id, { status: "oom", exit_code: run.exitCode, peak_commit_bytes: run.peakCommitBytes, ended_at: endedAt });
+          if (run.peakCommitBytes !== null) updateGateStats(store, entry.gate.project, commandHash(run.cmd), run.peakCommitBytes);
+        }
+        if (run.status === "oom" && entry.gate.attempt === 1) {
           entry.gate.exclusiveRetry = true;
           entry.gate.lastWait = undefined;
+          const retry = createGateRun(store, {
+            task: entry.gate.task,
+            cmd: entry.gate.cmd,
+            ram_est_bytes: entry.gate.estimateBytes,
+            attempt: 2,
+            retry_of: entry.gate.id,
+          });
+          entry.gate.currentAttemptId = retry.id;
+          entry.gate.attemptIds.push(retry.id);
+          entry.gate.attempt = 2;
           queued.push(entry.gate);
-          updateGateRun(store, id, { status: "queued", ended_at: null });
         } else {
-          completed.add(id);
+          completed.add(entry.gate.id);
         }
         continue;
       }
 
       if (entry.pid !== undefined && !isProcessAlive(entry.pid)) {
-        active.delete(id);
-        releaseMemoryLease(store, id);
-        updateGateRun(store, id, { status: "fail", exit_code: 1, ended_at: now() });
-        writeGateLauncherError(store, id, new Error("Gate launcher exited without recording a result"));
-        completed.add(id);
+        const logPath = gateLogPath(store, entry.gate.task, id);
+        const pattern = matchStderrOomPattern(readGateLogTail(logPath));
+        if (pattern !== undefined) {
+          updateGateRun(store, id, { status: "oom", exit_code: 1, ended_at: now() });
+          const descriptor = openSync(logPath, "a");
+          try { writeSync(descriptor, `[agent-board gate classification signal=stderr:${pattern} status=oom]\n`); }
+          finally { closeSync(descriptor); }
+        } else {
+          active.delete(id);
+          releaseMemoryLease(store, id);
+          updateGateRun(store, id, { status: "fail", exit_code: 1, ended_at: now() });
+          writeGateLauncherError(store, id, new Error("Gate launcher exited without recording a result"));
+          completed.add(entry.gate.id);
+        }
       }
     }
 
     if (completed.size < planned.length) await new Promise((resolvePromise) => setTimeout(resolvePromise, 1000));
   }
 
-  return summaries(store, taskId).filter((run) => planned.some((gate) => gate.id === run.id));
+  return summaries(store, planned);
 }
 
 function writeGateLauncherError(store: BoardStore, gateRunId: string, error: unknown): void {
@@ -251,6 +339,8 @@ export async function gateInternal(gateRunId: string): Promise<void> {
   let exitCode = 1;
   let status: "pass" | "fail" | "oom" = "fail";
   let peak: number | null = null;
+  let memoryLimitObserved = false;
+  let classificationLogged = false;
   try {
     const run = getGateRun(store, gateRunId);
     const lease = getMemoryLeaseByRef(store, "gate", gateRunId);
@@ -272,16 +362,29 @@ export async function gateInternal(gateRunId: string): Promise<void> {
       ...(invocation.windowsVerbatimArguments === undefined ? {} : { windowsVerbatimArguments: invocation.windowsVerbatimArguments }),
     });
     let stderrTail = "";
+    let stderrOomPattern: string | undefined;
     child.stdout.pipe(logOutput, { end: false });
     child.stderr.pipe(logOutput, { end: false });
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       stderrTail = `${stderrTail}${chunk}`.slice(-8192);
+      if (stderrOomPattern === undefined) {
+        stderrOomPattern = matchStderrOomPattern(stderrTail);
+      }
     });
-    let memoryLimitMessage = false;
-    const watcher = setInterval(() => {
-      if (resourceSession && !memoryLimitMessage && resourceSession.pollMemoryLimit()) memoryLimitMessage = true;
-    }, 100);
+    const completionMessages = new Set<number>();
+    const drainCompletionPort = () => {
+      for (const message of resourceSession?.pollMessages() ?? []) {
+        completionMessages.add(message);
+        if (message === 10 && !memoryLimitObserved) {
+          memoryLimitObserved = true;
+          updateGateRun(store, gateRunId, { status: "oom", started_at: startedAt });
+          writeSync(descriptor!, "[agent-board gate classification signal=port:10 status=oom observed]\n");
+          classificationLogged = true;
+        }
+      }
+    };
+    const watcher = setInterval(drainCompletionPort, 100);
     try {
       exitCode = await new Promise<number>((resolvePromise) => {
         child.once("error", (error) => {
@@ -290,7 +393,16 @@ export async function gateInternal(gateRunId: string): Promise<void> {
         });
         child.once("close", (code) => resolvePromise(code ?? 1));
       });
-      if (!memoryLimitMessage && resourceSession.pollMemoryLimit()) memoryLimitMessage = true;
+      drainCompletionPort();
+      if (process.platform === "win32") {
+        // Completion notifications are ordered; wait for the final process-zero
+        // packet, or bound the wait in case the launcher itself keeps the job active.
+        const deadline = Date.now() + 2000;
+        while (!completionMessages.has(ACTIVE_PROCESS_ZERO) && Date.now() < deadline) {
+          await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
+          drainCompletionPort();
+        }
+      }
     } finally {
       clearInterval(watcher);
     }
@@ -299,8 +411,13 @@ export async function gateInternal(gateRunId: string): Promise<void> {
     await new Promise<void>((resolvePromise) => logOutput.once("finish", resolvePromise));
 
     peak = resourceSession.peakMemoryBytes();
-    const stderrLooksLikeOom = exitCode !== 0 && /out of memory|memoryerror|std::bad_alloc/i.test(stderrTail);
-    status = memoryLimitMessage || stderrLooksLikeOom ? "oom" : exitCode === 0 ? "pass" : "fail";
+    const signal = completionMessages.has(10)
+      ? "port:10"
+      : exitCode !== 0 && stderrOomPattern !== undefined
+        ? `stderr:${stderrOomPattern}`
+        : "none";
+    status = signal !== "none" ? "oom" : exitCode === 0 ? "pass" : "fail";
+    if (!classificationLogged) writeSync(descriptor, `[agent-board gate classification signal=${signal} status=${status}]\n`);
     const previousPeak = getGateRun(store, run.id).peakCommitBytes;
     const peakMax = peak === null ? previousPeak : Math.max(previousPeak ?? 0, peak);
     updateGateRun(store, run.id, {
@@ -324,7 +441,7 @@ export async function gateInternal(gateRunId: string): Promise<void> {
       const run = getGateRun(store, gateRunId);
       peak = resourceSession?.peakMemoryBytes() ?? run.peakCommitBytes;
       updateGateRun(store, gateRunId, {
-        status: "fail",
+        status: memoryLimitObserved ? "oom" : "fail",
         exit_code: exitCode,
         ...(peak === null ? {} : { peak_commit_bytes: peak }),
         started_at: run.startedAt ?? startedAt,

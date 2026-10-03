@@ -79,6 +79,17 @@ function createWindowsJob(memoryLimitBytes: number): ResourceLimitSession {
     const completionBytes = new Uint32Array(1);
     const completionKey = new BigUint64Array(1);
     const completionOverlapped = new BigUint64Array(1);
+    const drainMessages = (): number[] => {
+      const messages: number[] = [];
+      // The same port carries process create/exit messages. Drain all queued
+      // notifications so a burst cannot leave message 10 behind old entries.
+      for (let attempt = 0; attempt < 1024; attempt += 1) {
+        const succeeded = Number(kernel.GetQueuedCompletionStatus!(port, ptr(completionBytes), ptr(completionKey), ptr(completionOverlapped), 0));
+        if (succeeded === 0) return messages;
+        messages.push(completionBytes[0]!);
+      }
+      return messages;
+    };
     let disposed = false;
     return {
       peakMemoryBytes() {
@@ -88,16 +99,9 @@ function createWindowsJob(memoryLimitBytes: number): ResourceLimitSession {
         return success === 0 ? null : Number(new DataView(peakInfo.buffer).getBigUint64(136, true));
       },
       pollMemoryLimit() {
-        let messageObserved = false;
-        // The same port carries process create/exit messages. Drain the queued
-        // notifications so a burst cannot leave message 10 behind old entries.
-        for (let attempt = 0; attempt < 1024; attempt += 1) {
-          const succeeded = Number(kernel.GetQueuedCompletionStatus!(port, ptr(completionBytes), ptr(completionKey), ptr(completionOverlapped), 0));
-          if (succeeded === 0) return messageObserved;
-          if (completionBytes[0] === JOB_OBJECT_MSG_JOB_MEMORY_LIMIT) messageObserved = true;
-        }
-        return messageObserved;
+        return drainMessages().includes(JOB_OBJECT_MSG_JOB_MEMORY_LIMIT);
       },
+      pollMessages: drainMessages,
       dispose() {
         if (disposed) return;
         disposed = true;

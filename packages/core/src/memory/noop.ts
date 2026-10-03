@@ -3,6 +3,7 @@ import type { ResourceLimiter, ResourceLimitSession } from "./resource-limiter";
 const session: ResourceLimitSession = {
   peakMemoryBytes: () => null,
   pollMemoryLimit: () => false,
+  pollMessages: () => [],
   dispose: () => {},
 };
 

@@ -6,6 +6,7 @@ import {
   sqliteTable,
   text,
 } from "drizzle-orm/sqlite-core";
+import type { AnySQLiteColumn } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 
 export const projects = sqliteTable("projects", {
@@ -114,6 +115,9 @@ export const gateRuns = sqliteTable("gate_runs", {
   status: text("status").notNull(),
   exitCode: integer("exit_code"),
   ramEstBytes: integer("ram_est_bytes").notNull(),
+  attempt: integer("attempt").notNull().default(1),
+  retryOf: text("retry_of").references((): AnySQLiteColumn => gateRuns.id),
+  leaseBytes: integer("lease_bytes"),
   peakCommitBytes: integer("peak_commit_bytes"),
   startedAt: text("started_at"),
   endedAt: text("ended_at"),
