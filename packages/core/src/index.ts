@@ -6,6 +6,7 @@ export * from "./prompts";
 export * from "./review";
 export * from "./runner";
 export * from "./schema";
+export * from "./snapshot";
 export * from "./state-machine";
 export * from "./store";
 export * from "./worktrees";
