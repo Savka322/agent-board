@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import {
   EventKindSchema,
+  BoardEventKindSchema,
   ExecutorQuestionSchema,
   GateStatusSchema,
   NormalizedEventSchema,
@@ -11,6 +12,7 @@ import {
   TaskCardSchema,
   TaskStatusSchema,
   type ExecutorQuestion,
+  type BoardEventKind,
   type GateStatus,
   type NormalizedEvent,
   type ProjectProfile,
@@ -29,9 +31,10 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { parseCardFile } from "./cards";
 import { resolveHome } from "./home";
-import { applyTransition, canStart, type Actor, type CanStartContext, type TaskAction, type TransitionResult } from "./state-machine";
+import { applyTransition, canStart, type Actor, type TaskAction, type TransitionResult } from "./state-machine";
 import {
   approvals,
+  boardEvents,
   decisions,
   epics,
   events,
@@ -41,6 +44,7 @@ import {
   questions,
   runs,
   schema,
+  settings,
   taskDecisions,
   taskDeps,
   taskLog,
@@ -55,6 +59,26 @@ const jsonEncode = (value: unknown): string => {
   return encoded;
 };
 const now = (): string => new Date().toISOString();
+
+const defaultSettings = {
+  max_slots: 5,
+  stale_minutes: 10,
+  tick_seconds: 3,
+  paused_until: null as string | null,
+  pause_backoff_minutes: 15,
+};
+
+export type BoardSettingKey = keyof typeof defaultSettings;
+
+export interface BoardEvent {
+  seq: number;
+  ts: string;
+  kind: BoardEventKind;
+  task: string | null;
+  question: string | null;
+  run: string | null;
+  payload: unknown;
+}
 
 export interface BoardStore {
   home: string;
@@ -89,11 +113,122 @@ export function openStore(home: string = resolveHome()): BoardStore {
   const db = drizzle(sqlite, { schema });
   const migrationsFolder = join(dirname(fileURLToPath(import.meta.url)), "..", "drizzle");
   migrate(db, { migrationsFolder });
+  for (const [key, value] of Object.entries(defaultSettings)) {
+    db.insert(settings).values({ key, value: jsonEncode(value) }).onConflictDoNothing().run();
+  }
   return { home, sqlite, db };
 }
 
 export function closeStore(store: BoardStore): void {
   store.sqlite.close(true);
+}
+
+export function getSetting<K extends BoardSettingKey>(store: BoardStore, key: K): typeof defaultSettings[K] {
+  const row = store.db.select({ value: settings.value }).from(settings).where(eq(settings.key, key)).get();
+  if (!row) return defaultSettings[key];
+  return JSON.parse(row.value) as typeof defaultSettings[K];
+}
+
+export function setSetting<K extends BoardSettingKey>(store: BoardStore, key: K, value: typeof defaultSettings[K]): void {
+  if (key === "max_slots" || key === "stale_minutes" || key === "tick_seconds" || key === "pause_backoff_minutes") {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+      throw new TypeError(`${key} must be a positive number`);
+    }
+    if (key === "max_slots" && !Number.isInteger(value)) throw new TypeError("max_slots must be a positive integer");
+  }
+  if (key === "paused_until" && value !== null && (typeof value !== "string" || Number.isNaN(Date.parse(value)))) {
+    throw new TypeError("paused_until must be an ISO date or null");
+  }
+  store.db.insert(settings).values({ key, value: jsonEncode(value) })
+    .onConflictDoUpdate({ target: settings.key, set: { value: jsonEncode(value) } }).run();
+}
+
+export function getInternalSetting<T>(store: BoardStore, key: string, fallback: T): T {
+  const row = store.db.select({ value: settings.value }).from(settings).where(eq(settings.key, key)).get();
+  return row ? JSON.parse(row.value) as T : fallback;
+}
+
+export function setInternalSetting(store: BoardStore, key: string, value: unknown): void {
+  store.db.insert(settings).values({ key, value: jsonEncode(value) })
+    .onConflictDoUpdate({ target: settings.key, set: { value: jsonEncode(value) } }).run();
+}
+
+export function listSettings(store: BoardStore) {
+  return (Object.keys(defaultSettings) as BoardSettingKey[]).map((key) => ({ key, value: getSetting(store, key) }));
+}
+
+function boardEventFromRow(row: typeof boardEvents.$inferSelect): BoardEvent {
+  return {
+    seq: row.seq,
+    ts: row.ts,
+    kind: BoardEventKindSchema.parse(row.kind),
+    task: row.task,
+    question: row.question,
+    run: row.run,
+    payload: JSON.parse(row.payload) as unknown,
+  };
+}
+
+export interface CreateBoardEventInput {
+  kind: BoardEventKind;
+  task?: string | null;
+  question?: string | null;
+  run?: string | null;
+  payload: unknown;
+}
+
+export interface BoardEventIdentity {
+  task?: string;
+  question?: string;
+  run?: string;
+}
+
+/** Record an event, optionally making a cause unique by kind and its stable task/question/run identity. */
+export function emitBoardEvent(store: BoardStore, input: CreateBoardEventInput, identity?: BoardEventIdentity): BoardEvent | null {
+  const kind = BoardEventKindSchema.parse(input.kind);
+  store.sqlite.exec("BEGIN IMMEDIATE");
+  try {
+    if (identity) {
+      const conditions = [eq(boardEvents.kind, kind)];
+      if (identity.task !== undefined) conditions.push(eq(boardEvents.task, identity.task));
+      if (identity.question !== undefined) conditions.push(eq(boardEvents.question, identity.question));
+      if (identity.run !== undefined) conditions.push(eq(boardEvents.run, identity.run));
+      const existing = store.db.select({ seq: boardEvents.seq }).from(boardEvents).where(and(...conditions)).get();
+      if (existing) {
+        store.sqlite.exec("COMMIT");
+        return null;
+      }
+    }
+    const inserted = store.db.insert(boardEvents).values({
+      ts: now(),
+      kind,
+      task: input.task ?? null,
+      question: input.question ?? null,
+      run: input.run ?? null,
+      payload: jsonEncode(input.payload),
+    }).returning().get();
+    if (!inserted) throw new Error("Board event insert returned no row");
+    store.sqlite.exec("COMMIT");
+    return boardEventFromRow(inserted);
+  } catch (error) {
+    try { store.sqlite.exec("ROLLBACK"); } catch { /* Preserve the original error. */ }
+    throw error;
+  }
+}
+
+export function getBoardEventCursor(store: BoardStore): number {
+  return store.db.select({ seq: max(boardEvents.seq) }).from(boardEvents).get()?.seq ?? 0;
+}
+
+export function listBoardEventsAfter(store: BoardStore, cursor: number, kinds?: BoardEventKind[]): BoardEvent[] {
+  if (!Number.isInteger(cursor) || cursor < 0) throw new TypeError("Board event cursor must be an integer >= 0");
+  const conditions = [sql`${boardEvents.seq} > ${cursor}`];
+  if (kinds && kinds.length > 0) conditions.push(inArray(boardEvents.kind, kinds));
+  return store.db.select().from(boardEvents).where(and(...conditions)).orderBy(asc(boardEvents.seq)).all().map(boardEventFromRow);
+}
+
+export function listRecentBoardEvents(store: BoardStore, kind: BoardEventKind, limit = 1000): BoardEvent[] {
+  return store.db.select().from(boardEvents).where(eq(boardEvents.kind, kind)).orderBy(desc(boardEvents.seq)).limit(limit).all().map(boardEventFromRow);
 }
 
 function parseProfileFile(path: string): ProjectProfile {
@@ -331,7 +466,6 @@ export function createQuestion(store: BoardStore, input: CreateQuestionInput) {
     recommendation: input.recommendation,
   });
   const options = questionFields.options;
-  if (input.decision_key !== null) decisionKeysSchema.parse([input.decision_key]);
   const task = getTask(store, input.task);
   const epic = getEpic(store, task.epic);
   const id = input.id ?? crypto.randomUUID();
@@ -351,7 +485,7 @@ export function createQuestion(store: BoardStore, input: CreateQuestionInput) {
     createdAt,
   };
   store.db.transaction((tx) => {
-    tx.insert(questions).values(row).run();
+    tx.insert(questions).values(row).onConflictDoNothing().run();
     if (input.decision_key !== null) {
       tx.insert(decisions).values({ project: epic.project, key: input.decision_key, title: input.decision_key, status: "open", answer: null, answeredAt: null }).onConflictDoNothing().run();
     }
@@ -373,24 +507,39 @@ function questionFromRow(row: typeof questions.$inferSelect) {
   };
 }
 
-export function answerQuestion(store: BoardStore, id: string, answer: string) {
+export function answerQuestion(store: BoardStore, id: string, answer: string, reject = false) {
+  store.sqlite.exec("BEGIN IMMEDIATE");
+  try {
   const current = store.db.select().from(questions).where(eq(questions.id, id)).get();
   if (!current) throw new StoreNotFoundError("Question", id);
+  if (current.status !== "open") throw new TypeError(`Question ${id} is already answered`);
+  if (reject && (current.kind !== "assume" || current.target !== "owner")) {
+    throw new TypeError("--reject applies only to owner assumption questions");
+  }
   const answeredAt = now();
-  store.db.transaction((tx) => {
-    tx.update(questions).set({ status: "answered", answer, answeredAt }).where(eq(questions.id, id)).run();
+  const status = reject ? "rejected" : "answered";
+  const payload = { answer, kind: current.kind, target: current.target, rejected: reject };
+    store.db.update(questions).set({ status, answer, answeredAt }).where(eq(questions.id, id)).run();
     if (current.decisionKey !== null) {
-      const task = tx.select({ epic: tasks.epic }).from(tasks).where(eq(tasks.id, current.task)).get();
+      const task = store.db.select({ epic: tasks.epic }).from(tasks).where(eq(tasks.id, current.task)).get();
       if (task) {
-        const epic = tx.select({ project: epics.project }).from(epics).where(eq(epics.id, task.epic)).get();
+        const epic = store.db.select({ project: epics.project }).from(epics).where(eq(epics.id, task.epic)).get();
         if (epic) {
-          tx.update(decisions).set({ status: "answered", answer, answeredAt })
+          store.db.update(decisions).set({ status, answer, answeredAt })
             .where(and(eq(decisions.project, epic.project), eq(decisions.key, current.decisionKey))).run();
         }
       }
     }
-  });
-  return questionFromRow({ ...current, status: "answered", answer, answeredAt });
+    store.db.insert(boardEvents).values({ ts: answeredAt, kind: "answer", task: current.task, question: id, run: null, payload: jsonEncode(payload) }).run();
+    if (reject) {
+      store.db.insert(boardEvents).values({ ts: answeredAt, kind: "assumption_rejected", task: current.task, question: id, run: null, payload: jsonEncode(payload) }).run();
+    }
+    store.sqlite.exec("COMMIT");
+  return questionFromRow({ ...current, status, answer, answeredAt });
+  } catch (error) {
+    try { store.sqlite.exec("ROLLBACK"); } catch { /* Preserve the original error. */ }
+    throw error;
+  }
 }
 
 export function getQuestion(store: BoardStore, id: string) {
@@ -412,6 +561,22 @@ export function listOpenQuestionsForProject(store: BoardStore, project: string) 
     .orderBy(asc(questions.createdAt))
     .all()
     .map(({ question }) => questionFromRow(question));
+}
+
+export interface ListQuestionsOptions {
+  open?: boolean;
+  target?: QuestionTarget;
+  task?: string;
+}
+
+export function listQuestions(store: BoardStore, options: ListQuestionsOptions = {}) {
+  const conditions = [];
+  if (options.open) conditions.push(eq(questions.status, "open"));
+  if (options.target) conditions.push(eq(questions.target, QuestionTargetSchema.parse(options.target)));
+  if (options.task) conditions.push(eq(questions.task, options.task));
+  const query = store.db.select().from(questions);
+  return (conditions.length > 0 ? query.where(and(...conditions)) : query)
+    .orderBy(asc(questions.createdAt), asc(questions.id)).all().map(questionFromRow);
 }
 
 export interface CreateRunInput {
@@ -517,8 +682,9 @@ export function finishRun(store: BoardStore, id: string, input: FinishRunInput) 
   const outcome = RunOutcomeSchema.parse(input.outcome);
   if (!Number.isInteger(input.exitCode)) throw new TypeError("exitCode must be an integer");
   const usage = input.usage === undefined || input.usage === null ? null : jsonEncode(input.usage);
-  const current = store.db.select({ id: runs.id }).from(runs).where(eq(runs.id, id)).get();
+  const current = store.db.select().from(runs).where(eq(runs.id, id)).get();
   if (!current) throw new StoreNotFoundError("Run", id);
+  if (current.endedAt !== null) return getRun(store, id);
   store.db.update(runs).set({
     endedAt: now(),
     exitCode: input.exitCode,
@@ -601,6 +767,19 @@ export function listRecentEvents(store: BoardStore, runId: string, limit = 20): 
       text: row.text,
       raw_line: row.rawLine,
     }));
+}
+
+export function getLatestRunEvent(store: BoardStore, runId: string): NormalizedEvent | null {
+  const row = store.db.select().from(events).where(eq(events.runId, runId)).orderBy(desc(events.seq)).limit(1).get();
+  if (!row) return null;
+  return NormalizedEventSchema.parse({
+    run_id: row.runId,
+    seq: row.seq,
+    ts: row.ts,
+    kind: EventKindSchema.parse(row.kind),
+    text: row.text,
+    raw_line: row.rawLine,
+  });
 }
 
 export interface CreateGateRunInput {
@@ -691,36 +870,60 @@ export function listApprovals(store: BoardStore, epic: string) {
   return store.db.select().from(approvals).where(eq(approvals.epic, epic)).orderBy(asc(approvals.createdAt)).all();
 }
 
-export function transitionTask(store: BoardStore, id: string, action: TaskAction, actor: Actor, maxSlots = 5, note?: string): StoredTask {
+export function canStartTask(store: BoardStore, id: string) {
+  const task = getTask(store, id);
+  const dependencyStatuses: Record<string, TaskStatus | undefined> = {};
+  for (const dependencyId of task.deps) {
+    const dependency = store.db.select({ status: tasks.status }).from(tasks).where(eq(tasks.id, dependencyId)).get();
+    dependencyStatuses[dependencyId] = dependency ? TaskStatusSchema.parse(dependency.status) : undefined;
+  }
+  const project = getEpic(store, task.epic).project;
+  const openQuestionRows = listOpenQuestionsForProject(store, project).map((question) => ({
+    id: question.id,
+    decision_key: question.decisionKey,
+    kind: question.kind,
+    status: "open" as const,
+  }));
+  const runningRows = store.db.select().from(tasks).where(eq(tasks.status, "running")).all().map((row) => ({
+    id: row.id,
+    allowed_files: parseJson(row.allowedFiles, TaskCardSchema.shape.allowed_files, "tasks.allowed_files"),
+  }));
+  return canStart(task.card, {
+    dependencyStatuses,
+    questions: openQuestionRows,
+    runningTasks: runningRows,
+    maxSlots: getSetting(store, "max_slots"),
+    pausedUntil: getSetting(store, "paused_until"),
+  });
+}
+
+export function transitionTask(store: BoardStore, id: string, action: TaskAction, actor: Actor, maxSlots?: number, note?: string): StoredTask {
   store.sqlite.exec("BEGIN IMMEDIATE");
   try {
     const task = getTask(store, id);
-    let transitionContext: { canStart?: ReturnType<typeof canStart> } = {};
+    const transitionContext: { canStart?: ReturnType<typeof canStart>; lastRunOutcome?: RunOutcome | null } = {};
     if (action === "start") {
-      const dependencyStatuses: Record<string, TaskStatus | undefined> = {};
-      for (const dependencyId of task.deps) {
-        const dependency = store.db.select({ status: tasks.status }).from(tasks).where(eq(tasks.id, dependencyId)).get();
-        dependencyStatuses[dependencyId] = dependency ? TaskStatusSchema.parse(dependency.status) : undefined;
-      }
-      const project = getEpic(store, task.epic).project;
-      const openQuestionRows = listOpenQuestionsForProject(store, project).map((question) => ({
-        id: question.id,
-        decision_key: question.decisionKey,
-        kind: question.kind,
-        status: "open" as const,
-      }));
-      const runningRows = store.db.select().from(tasks).where(eq(tasks.status, "running")).all().map((row) => ({
-        id: row.id,
-        allowed_files: parseJson(row.allowedFiles, TaskCardSchema.shape.allowed_files, "tasks.allowed_files"),
-      }));
-      const ctx: CanStartContext = {
-        dependencyStatuses,
-        questions: openQuestionRows,
-        runningTasks: runningRows,
+      const availability = canStartTask(store, id);
+      transitionContext.canStart = maxSlots === undefined ? availability : canStart(task.card, {
         maxSlots,
-      };
-      transitionContext = { canStart: canStart(task.card, ctx) };
+        dependencyStatuses: Object.fromEntries(task.deps.map((dependencyId) => {
+          const dependency = store.db.select({ status: tasks.status }).from(tasks).where(eq(tasks.id, dependencyId)).get();
+          return [dependencyId, dependency ? TaskStatusSchema.parse(dependency.status) : undefined];
+        })),
+        questions: listOpenQuestionsForProject(store, getEpic(store, task.epic).project).map((question) => ({
+          id: question.id,
+          decision_key: question.decisionKey,
+          kind: question.kind,
+          status: "open" as const,
+        })),
+        runningTasks: store.db.select().from(tasks).where(eq(tasks.status, "running")).all().map((row) => ({
+          id: row.id,
+          allowed_files: parseJson(row.allowedFiles, TaskCardSchema.shape.allowed_files, "tasks.allowed_files"),
+        })),
+        pausedUntil: getSetting(store, "paused_until"),
+      });
     }
+    if (action === "requeue") transitionContext.lastRunOutcome = listRunsForTask(store, id).at(-1)?.outcome ?? null;
     const result = applyTransition(task, action, actor, transitionContext);
     if (!result.ok) throw new IllegalTaskTransitionError(result);
 
@@ -736,6 +939,7 @@ export function transitionTask(store: BoardStore, id: string, action: TaskAction
     try { store.sqlite.exec("ROLLBACK"); } catch { /* Preserve the original error. */ }
     throw error;
   }
+  if (getTask(store, id).status !== "next") setInternalSetting(store, `dispatcher.ready:${id}`, false);
   return getTask(store, id);
 }
 

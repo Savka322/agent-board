@@ -10,6 +10,7 @@ import {
   closeStore,
   createQuestion,
   createRun,
+  emitBoardEvent,
   finishRun,
   getEpic,
   getProject,
@@ -94,10 +95,12 @@ export function startTask(store: ReturnType<typeof openStore>, taskId: string): 
   try {
     writePromptAndSchema(files, prompt);
     const pid = spawnDetachedRunner(run.id);
+    if (pid !== undefined) setRunPid(store, run.id, pid);
     return { run_id: run.id, task: taskId, round: run.round, pid };
   } catch (error) {
     finishRun(store, run.id, { outcome: "failed", exitCode: 1 });
     transitionTask(store, taskId, "run_finished", "runner");
+    emitBoardEvent(store, { kind: "review", task: taskId, run: run.id, payload: "failed" }, { run: run.id });
     throw error;
   }
 }
@@ -110,7 +113,7 @@ export function resumeTask(store: ReturnType<typeof openStore>, taskId: string, 
   if (!prior?.sessionId) throw new Error(`Task ${taskId} has no previous Codex session to resume`);
   const epic = getEpic(store, task.epic);
   const profile = getProject(store, epic.project).profile;
-  const runningTask = transitionTask(store, taskId, "resume", "claude", 5, notePath);
+  const runningTask = transitionTask(store, taskId, "resume", "claude", undefined, notePath);
   let files: RunFiles;
   let prompt: string;
   try {
@@ -127,10 +130,12 @@ export function resumeTask(store: ReturnType<typeof openStore>, taskId: string, 
     writePromptAndSchema(files, prompt);
     writeFileSync(files.note, note, "utf8");
     const pid = spawnDetachedRunner(run.id);
+    if (pid !== undefined) setRunPid(store, run.id, pid);
     return { run_id: run.id, task: taskId, round: run.round, pid };
   } catch (error) {
     finishRun(store, run.id, { outcome: "failed", exitCode: 1 });
     transitionTask(store, taskId, "run_finished", "runner");
+    emitBoardEvent(store, { kind: "review", task: taskId, run: run.id, payload: "failed" }, { run: run.id });
     throw error;
   }
 }
@@ -145,6 +150,7 @@ export function stopTask(store: ReturnType<typeof openStore>, taskId: string) {
   finishRun(store, active.id, { outcome: "canceled", exitCode: 1 });
   writeTaskLog(store, { task: taskId, actor: "claude", action: "stop" });
   transitionTask(store, taskId, "run_finished", "runner");
+  emitBoardEvent(store, { kind: "review", task: taskId, run: active.id, payload: "canceled" }, { run: active.id });
   return { task: taskId, run_id: active.id, outcome: "canceled" as const };
 }
 
@@ -312,9 +318,22 @@ async function runExecutor(store: ReturnType<typeof openStore>, runId: string): 
         recommendation: report.question.recommendation,
       });
     }
+    for (const [index, assumption] of (report?.assumptions ?? []).entries()) {
+      createQuestion(store, {
+        id: `assumption-${run.id}-${index + 1}`,
+        task: task.id,
+        kind: "assume",
+        target: "owner",
+        decision_key: assumption.decision_key,
+        text: assumption.text,
+        options: [],
+        recommendation: "Confirm or reject this assumption.",
+      });
+    }
   } finally {
     transitionTask(store, task.id, "run_finished", "runner");
   }
+  emitBoardEvent(store, { kind: "review", task: task.id, run: runId, payload: outcome }, { run: runId });
   if (consumerError) throw consumerError;
 }
 
@@ -329,6 +348,7 @@ export async function runInternal(runId: string): Promise<void> {
       if (run.endedAt === null) {
         finishRun(store, runId, { outcome: "failed", exitCode: 1, reportPath: run.reportPath, rawPath: run.rawPath });
         transitionTask(store, run.task, "run_finished", "runner");
+        emitBoardEvent(store, { kind: "review", task: run.task, run: run.id, payload: "failed" }, { run: run.id });
       }
     } catch {
       // Keep the worker's original failure as its exit reason.

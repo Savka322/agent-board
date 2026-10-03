@@ -1,5 +1,6 @@
 export * from "./cards";
 export * from "./codex-normalizer";
+export * from "./dispatcher";
 export * from "./home";
 export * from "./prompts";
 export * from "./review";
@@ -8,3 +9,4 @@ export * from "./schema";
 export * from "./state-machine";
 export * from "./store";
 export * from "./worktrees";
+export * from "./wait";

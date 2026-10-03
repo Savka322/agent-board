@@ -15,6 +15,13 @@
       "when": 1790979043866,
       "tag": "0001_task_log",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1790987265147,
+      "tag": "0002_salty_black_crow",
+      "breakpoints": true
     }
   ]
 }

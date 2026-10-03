@@ -1,4 +1,4 @@
-import type { QuestionKind, TaskStatus } from "@agent-board/contracts";
+import type { QuestionKind, RunOutcome, TaskStatus } from "@agent-board/contracts";
 
 export type Actor = "claude" | "owner" | "runner" | "dispatcher";
 export type TaskAction =
@@ -10,6 +10,7 @@ export type TaskAction =
   | "owner_answered"
   | "accept"
   | "reject"
+  | "requeue"
   | "cancel";
 
 export interface StartTask {
@@ -29,12 +30,14 @@ export interface CanStartContext {
   }>;
   runningTasks?: Array<{ id: string; allowed_files: string[] }>;
   maxSlots?: number;
+  pausedUntil?: string | null;
 }
 
 export type CanStartReason =
   | { code: "deps_pending"; ids: string[] }
   | { code: "waiting_answer"; ids: string[] }
   | { code: "no_slot" }
+  | { code: "paused"; until: string }
   | { code: "file_overlap"; ids: string[] };
 
 export type CanStartResult = { ok: true; reasons: [] } | { ok: false; reasons: CanStartReason[] };
@@ -68,6 +71,10 @@ export function canStart(task: StartTask, ctx: CanStartContext = {}): CanStartRe
     .map((question) => question.id);
   if (waitingQuestions.length > 0) reasons.push({ code: "waiting_answer", ids: waitingQuestions });
 
+  if (ctx.pausedUntil && Date.parse(ctx.pausedUntil) > Date.now()) {
+    reasons.push({ code: "paused", until: ctx.pausedUntil });
+  }
+
   const running = (ctx.runningTasks ?? []).filter((other) => other.id !== task.id);
   if (running.length >= (ctx.maxSlots ?? 5)) reasons.push({ code: "no_slot" });
 
@@ -89,9 +96,10 @@ export interface TransitionTask {
 
 export interface TransitionContext {
   canStart?: CanStartResult;
+  lastRunOutcome?: RunOutcome | null;
 }
 
-export type TransitionErrorCode = "wrong_actor" | "wrong_status" | "unknown_action" | "start_blocked" | "max_rounds";
+export type TransitionErrorCode = "wrong_actor" | "wrong_status" | "unknown_action" | "start_blocked" | "max_rounds" | "requeue_requires_rate_limited";
 export type TransitionResult =
   | { ok: true; status: TaskStatus; round: number }
   | { ok: false; error: { code: TransitionErrorCode; reasons?: CanStartReason[] } };
@@ -109,6 +117,7 @@ const transitionRules: Record<Exclude<TaskAction, "cancel">, {
   owner_answered: { from: "needs_owner", to: "next", actor: "owner" },
   accept: { from: "review", to: "done", actor: "claude" },
   reject: { from: "review", to: "todo", actor: "claude" },
+  requeue: { from: "review", to: "next", actor: "dispatcher" },
 };
 
 export function applyTransition(
@@ -127,6 +136,9 @@ export function applyTransition(
   const rule = transitionRules[action];
   if (actor !== rule.actor) return { ok: false, error: { code: "wrong_actor" } };
   if (task.status !== rule.from) return { ok: false, error: { code: "wrong_status" } };
+  if (action === "requeue" && ctx.lastRunOutcome !== "rate_limited") {
+    return { ok: false, error: { code: "requeue_requires_rate_limited" } };
+  }
   if (action === "start" && ctx.canStart?.ok !== true) {
     return {
       ok: false,
@@ -136,7 +148,7 @@ export function applyTransition(
   if (action === "resume" && task.round >= 3) return { ok: false, error: { code: "max_rounds" } };
 
   let round = task.round;
-  if (action === "start") round = 1;
+  if (action === "start") round = task.round === 0 ? 1 : task.round + 1;
   if (action === "resume") round += 1;
   if (action === "reject") round = 0;
   return { ok: true, status: rule.to, round };

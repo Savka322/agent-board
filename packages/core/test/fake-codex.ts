@@ -52,7 +52,9 @@ if (reportPath && process.env.AGENT_BOARD_FAKE_MISSING_REPORT !== "1") {
     summary: "Fake executor completed the configured run.",
     files_changed: changedFiles,
     tests_run: [],
-    assumptions: [],
+    assumptions: process.env.AGENT_BOARD_FAKE_ASSUMPTIONS
+      ? JSON.parse(process.env.AGENT_BOARD_FAKE_ASSUMPTIONS) as Array<{ decision_key: string | null; text: string }>
+      : [],
     question,
     notes: "Fake Codex test report.",
   };

@@ -1,5 +1,6 @@
 import {
   integer,
+  index,
   primaryKey,
   sqliteTable,
   text,
@@ -130,6 +131,24 @@ export const approvals = sqliteTable("approvals", {
   createdAt: text("created_at").notNull(),
 });
 
+export const boardEvents = sqliteTable("board_events", {
+  seq: integer("seq").primaryKey({ autoIncrement: true }),
+  ts: text("ts").notNull(),
+  kind: text("kind").notNull(),
+  task: text("task"),
+  question: text("question"),
+  run: text("run"),
+  payload: text("payload").notNull(),
+}, (table) => [
+  index("board_events_kind_seq_idx").on(table.kind, table.seq),
+  index("board_events_run_idx").on(table.run),
+]);
+
+export const settings = sqliteTable("settings", {
+  key: text("key").primaryKey(),
+  value: text("value").notNull(),
+});
+
 export const schema = {
   projects,
   epics,
@@ -144,4 +163,6 @@ export const schema = {
   gateRuns,
   gateStats,
   approvals,
+  boardEvents,
+  settings,
 };

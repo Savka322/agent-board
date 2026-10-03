@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, realpathSync, rmSync, statSync, symlinkSync, linkSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, realpathSync, rmSync, statSync, symlinkSync, linkSync, unlinkSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ProjectProfile } from "@agent-board/contracts";
 import { getEpic, getProject, getTask, type BoardStore } from "./store";
@@ -100,17 +100,35 @@ function applyDataLinks(worktree: string, profile: ProjectProfile): string[] {
       const destinationStats = statSync(destination);
       const sameHardLink = !sourceIsDirectory && existing.isFile() && destinationStats.isFile()
         && destinationStats.dev === statSync(source).dev && destinationStats.ino === statSync(source).ino;
-      if (sameTarget || sameHardLink) {
+      if (dataLink.mode === "link" && (sameTarget || sameHardLink)) {
         destinations.push(relativeDestination.replace(/\\/g, "/"));
         continue;
       }
-      throw new Error(`Data link destination already exists: ${dataLink.to}`);
+      if (dataLink.mode === "copy") {
+        if (sameTarget || sameHardLink) unlinkSync(destination);
+        else if (existing.isSymbolicLink() || (sourceIsDirectory ? !destinationStats.isDirectory() : !destinationStats.isFile())) {
+          throw new Error(`Data copy destination has an incompatible entry: ${dataLink.to}`);
+        } else {
+          destinations.push(relativeDestination.replace(/\\/g, "/"));
+          continue;
+        }
+      } else {
+        throw new Error(`Data link destination already exists: ${dataLink.to}`);
+      }
     }
     try {
-      if (sourceIsDirectory) symlinkSync(source, destination, "junction");
-      else linkSync(source, destination);
+      if (dataLink.mode === "copy") {
+        cpSync(source, destination, { recursive: true, force: false, errorOnExist: true, dereference: true });
+      } else if (sourceIsDirectory) {
+        // Link mode shares executor writes with the source tree; copy mode is safer for mutable data.
+        symlinkSync(source, destination, "junction");
+      } else {
+        // A hard link shares file contents, so executor writes reach the source file.
+        linkSync(source, destination);
+      }
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
+      if (dataLink.mode === "copy") throw new Error(`Could not copy data into the worktree (${dataLink.to}): ${detail}`);
       if (sourceIsDirectory) throw new Error(`Could not create data directory junction ${dataLink.to}: ${detail}`);
       throw new Error(`Could not hard-link data file ${dataLink.to} (source and worktree may be on different volumes): ${detail}`);
     }

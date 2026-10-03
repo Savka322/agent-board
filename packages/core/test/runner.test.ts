@@ -8,13 +8,17 @@ import {
   getEpic,
   getRun,
   getTask,
+  canStartTask,
+  listBoardEventsAfter,
   listEventsAfter,
+  listQuestions,
   listRunsForTask,
   listTaskLog,
   openStore,
   type BoardStore,
 } from "../src/store";
-import { ensureTaskWorktree, getEpicWorktreePath, getTaskWorktreePath, removeLeftoverWorktree, removeTaskWorktree } from "../src/worktrees";
+import { changedFiles, ensureTaskWorktree, getEpicWorktreePath, getTaskWorktreePath, removeLeftoverWorktree, removeTaskWorktree } from "../src/worktrees";
+import { dispatchTick } from "../src/dispatcher";
 
 const root = resolve(import.meta.dir, "../../..");
 const fakeCodex = resolve(import.meta.dir, "fake-codex.ts");
@@ -30,6 +34,7 @@ const controlledVariables = [
   "AGENT_BOARD_FAKE_SPLIT_UTF8",
   "AGENT_BOARD_FAKE_EXIT_CODE",
   "AGENT_BOARD_FAKE_SESSION_LOG",
+  "AGENT_BOARD_FAKE_ASSUMPTIONS",
 ];
 
 let tempRoot = "";
@@ -69,8 +74,8 @@ function toml(value: string): string {
   return JSON.stringify(value);
 }
 
-function writeProfile(dataLinks: Array<{ from: string; to: string }> = []): void {
-  const linkRows = dataLinks.map(({ from, to }) => `{ from = ${toml(from)}, to = ${toml(to)} }`).join(", ");
+function writeProfile(dataLinks: Array<{ from: string; to: string; mode?: "copy" | "link" }> = []): void {
+  const linkRows = dataLinks.map(({ from, to, mode }) => `{ from = ${toml(from)}, to = ${toml(to)}${mode ? `, mode = ${toml(mode)}` : ""} }`).join(", ");
   const contents = [
     `name = ${toml("sample")}`,
     `repo = ${toml(repo)}`,
@@ -179,6 +184,7 @@ describe("runner, worktrees, review, and agentctl", () => {
     delete process.env.AGENT_BOARD_FAKE_EXIT_CODE;
     sessionCapture = join(tempRoot, "fake-sessions.log");
     process.env.AGENT_BOARD_FAKE_SESSION_LOG = sessionCapture;
+    delete process.env.AGENT_BOARD_FAKE_ASSUMPTIONS;
     writeProfile();
     writeCard();
     store = openStore(home);
@@ -359,13 +365,125 @@ describe("runner, worktrees, review, and agentctl", () => {
     expect(answer.task.status).toBe("next");
   });
 
+  test("stores report assumptions as open non-blocking owner questions and records rejection", async () => {
+    cliSetup();
+    cliJson(["task", "promote", "AB-1"]);
+    process.env.AGENT_BOARD_FAKE_EDIT = "nothing";
+    process.env.AGENT_BOARD_FAKE_ASSUMPTIONS = JSON.stringify([
+      { decision_key: "api_shape", text: "The API follows the existing client convention." },
+      { decision_key: null, text: "The generated file remains checked in." },
+    ]);
+    const started = cliJson<{ run_id: string }>(["start", "AB-1"]);
+    await waitForRun(started.run_id);
+    const assumptions = listQuestions(store!, { open: true, target: "owner" });
+    expect(assumptions).toHaveLength(2);
+    expect(assumptions.map(({ kind, text }) => ({ kind, text }))).toEqual([
+      { kind: "assume", text: "The API follows the existing client convention." },
+      { kind: "assume", text: "The generated file remains checked in." },
+    ]);
+    expect(getTask(store!, "AB-1").status).toBe("review");
+    expect(listBoardEventsAfter(store!, 0, ["review"]).filter((event) => event.run === started.run_id).map((event) => event.payload)).toEqual(["done"]);
+
+    const rejected = cliJson<{ question: { status: string }; task: { status: string } }>([
+      "answer", assumptions[0]!.id, "Use the other convention", "--reject",
+    ]);
+    expect(rejected.question.status).toBe("rejected");
+    expect(rejected.task.status).toBe("review");
+    expect(listBoardEventsAfter(store!, 0, ["answer", "assumption_rejected"]).map(({ kind, question }) => ({ kind, question }))).toEqual([
+      { kind: "answer", question: assumptions[0]!.id },
+      { kind: "assumption_rejected", question: assumptions[0]!.id },
+    ]);
+  });
+
+  test("answers a BLOCKED report question addressed to the orchestrator without changing status", async () => {
+    cliSetup();
+    cliJson(["task", "promote", "AB-1"]);
+    process.env.AGENT_BOARD_FAKE_EDIT = "nothing";
+    process.env.AGENT_BOARD_FAKE_STATUS = "BLOCKED";
+    const started = cliJson<{ run_id: string }>(["start", "AB-1"]);
+    await waitForRun(started.run_id);
+    const question = listQuestions(store!, { open: true, target: "claude" })[0]!;
+    expect(question.kind).toBe("stop");
+    expect(getTask(store!, "AB-1").status).toBe("review");
+
+    const answer = cliJson<{ question: { status: string }; task: { status: string } }>(["answer", question.id, "Proceed with option A"]);
+    expect(answer.question.status).toBe("answered");
+    expect(answer.task.status).toBe("review");
+  });
+
+  test("copies default data links so executor writes do not reach their source", () => {
+    const sourceFile = join(tempRoot, "copied-data.json");
+    writeFileSync(sourceFile, "source data\n", "utf8");
+    writeProfile([{ from: sourceFile, to: "data/source.json" }]);
+    cliSetup();
+    const taskPath = ensureTaskWorktree(store!, "AB-1").path;
+    writeFileSync(join(taskPath, "data", "source.json"), "executor data\n", "utf8");
+    expect(readFileSync(sourceFile, "utf8")).toBe("source data\n");
+    expect(changedFiles(store!, "AB-1")).toEqual([]);
+  });
+
+  test("preserves shared writes for an explicit link-mode data link", () => {
+    const sourceFile = join(tempRoot, "linked-data.json");
+    writeFileSync(sourceFile, "source data\n", "utf8");
+    writeProfile([{ from: sourceFile, to: "data/source.json", mode: "link" }]);
+    cliSetup();
+    const taskPath = ensureTaskWorktree(store!, "AB-1").path;
+    writeFileSync(join(taskPath, "data", "source.json"), "executor data\n", "utf8");
+    expect(readFileSync(sourceFile, "utf8")).toBe("executor data\n");
+    expect(changedFiles(store!, "AB-1")).toEqual([]);
+  });
+
+  test("emits a compact status payload", () => {
+    cliSetup();
+    const status = cliJson<{ tasks: Array<Record<string, unknown>> }>(["status"]);
+    expect(Object.keys(status.tasks[0]!).sort()).toEqual(["epic", "id", "labels", "prio", "round", "status", "title"]);
+  });
+
+  test("reads and updates dispatcher settings", () => {
+    cliSetup();
+    const settings = cliJson<Array<{ key: string; value: unknown }>>(["settings", "--set", "stale_minutes=0.01"]);
+    expect(settings.find(({ key }) => key === "stale_minutes")?.value).toBe(0.01);
+  });
+
+  test("prints help for every command and reports a wait timeout with exit code 3", () => {
+    const helpCommands = [
+      [], ["project"], ["project", "add"], ["project", "show"], ["epic"], ["epic", "new"], ["epic", "status"],
+      ["task"], ["task", "add"], ["task", "show"], ["task", "promote"], ["task", "prio"], ["task", "cancel"],
+      ["start"], ["resume"], ["stop"], ["review"], ["accept"], ["reject"], ["ask"], ["answer"], ["questions"],
+      ["status"], ["wait"], ["serve"], ["settings"], ["log"],
+    ];
+    for (const command of helpCommands) {
+      const help = cli([...command, "--help"]);
+      expect(help.status).toBe(0);
+      expect(help.stdout).toContain("Usage: agentctl");
+    }
+
+    const timeout = cli(["wait", "--for", "ready", "--timeout", "0", "--json"]);
+    expect(timeout.status).toBe(3);
+    expect(JSON.parse(timeout.stdout)).toEqual({ events: [], cursor: 0 });
+  });
+
+  test("rate-limited runs are requeued and pause starts are exposed to canStart", async () => {
+    cliSetup();
+    cliJson(["task", "promote", "AB-1"]);
+    process.env.AGENT_BOARD_FAKE_EDIT = "nothing";
+    process.env.AGENT_BOARD_FAKE_STDERR = "Rate limit exceeded";
+    process.env.AGENT_BOARD_FAKE_EXIT_CODE = "1";
+    const started = cliJson<{ run_id: string }>(["start", "AB-1"]);
+    expect((await waitForRun(started.run_id)).outcome).toBe("rate_limited");
+    const tick = dispatchTick(store!);
+    expect(tick.paused).toEqual([started.run_id]);
+    expect(getTask(store!, "AB-1").status).toBe("next");
+    expect(canStartTask(store!, "AB-1").reasons).toContainEqual({ code: "paused", until: expect.any(String) });
+  });
+
   test("creates directory junctions and file hard links without including them as changes", async () => {
     const dataDirectory = join(tempRoot, "linked-directory");
     const sourceFile = join(tempRoot, "linked-file.json");
     mkdirSync(dataDirectory, { recursive: true });
     writeFileSync(join(dataDirectory, "source.txt"), "directory data\n", "utf8");
     writeFileSync(sourceFile, "file data\n", "utf8");
-    writeProfile([{ from: dataDirectory, to: "shared" }, { from: sourceFile, to: "config/local.json" }]);
+    writeProfile([{ from: dataDirectory, to: "shared", mode: "link" }, { from: sourceFile, to: "config/local.json", mode: "link" }]);
     cliSetup();
     cliJson(["task", "promote", "AB-1"]);
     process.env.AGENT_BOARD_FAKE_EDIT = "nothing";

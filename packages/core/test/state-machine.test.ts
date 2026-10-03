@@ -4,7 +4,7 @@ import { installFreshHome } from "./helpers";
 
 installFreshHome(false);
 
-const transitions: Array<{ action: TaskAction; from: string; to: string; actor: "claude" | "owner" | "runner"; round?: number; ctx?: { canStart: { ok: true; reasons: [] } } }> = [
+const transitions: Array<{ action: TaskAction; from: string; to: string; actor: "claude" | "owner" | "runner" | "dispatcher"; round?: number; ctx?: { canStart?: { ok: true; reasons: [] }; lastRunOutcome?: "rate_limited" } }> = [
   { action: "promote", from: "todo", to: "next", actor: "claude" },
   { action: "start", from: "next", to: "running", actor: "claude", ctx: { canStart: { ok: true, reasons: [] } } },
   { action: "run_finished", from: "running", to: "review", actor: "runner" },
@@ -13,13 +13,14 @@ const transitions: Array<{ action: TaskAction; from: string; to: string; actor: 
   { action: "owner_answered", from: "needs_owner", to: "next", actor: "owner" },
   { action: "accept", from: "review", to: "done", actor: "claude" },
   { action: "reject", from: "review", to: "todo", actor: "claude" },
+  { action: "requeue", from: "review", to: "next", actor: "dispatcher", ctx: { lastRunOutcome: "rate_limited" } },
   { action: "cancel", from: "todo", to: "canceled", actor: "owner" },
 ];
 
 describe("task state machine", () => {
   test("allows every defined transition", () => {
     for (const rule of transitions) {
-    const task = { status: rule.from as never, round: rule.action === "resume" ? 1 : 2 };
+      const task = { status: rule.from as never, round: rule.action === "start" ? 0 : rule.action === "resume" ? 1 : 2 };
       const result = applyTransition(task, rule.action, rule.actor, rule.ctx);
       expect(result).toMatchObject({ ok: true, status: rule.to });
       if (rule.action === "start") expect(result).toMatchObject({ round: 1 });
@@ -45,11 +46,14 @@ describe("task state machine", () => {
     expect(applyTransition({ status: "next", round: 0 }, "start", "claude")).toMatchObject({ ok: false, error: { code: "start_blocked" } });
     expect(applyTransition({ status: "next", round: 0 }, "start", "claude", { canStart: { ok: false, reasons: [{ code: "no_slot" }] } })).toMatchObject({ ok: false, error: { code: "start_blocked", reasons: [{ code: "no_slot" }] } });
     expect(applyTransition({ status: "next", round: 0 }, "start", "claude", { canStart: { ok: true, reasons: [] } })).toMatchObject({ ok: true, status: "running", round: 1 });
+    expect(applyTransition({ status: "next", round: 1 }, "start", "claude", { canStart: { ok: true, reasons: [] } })).toMatchObject({ ok: true, status: "running", round: 2 });
     expect(applyTransition({ status: "review", round: 1 }, "resume", "claude")).toMatchObject({ ok: true, status: "running", round: 2 });
     expect(applyTransition({ status: "review", round: 2 }, "resume", "claude")).toMatchObject({ ok: true, status: "running", round: 3 });
     expect(applyTransition({ status: "review", round: 3 }, "resume", "claude")).toMatchObject({ ok: false, error: { code: "max_rounds" } });
     expect(applyTransition({ status: "review", round: 2 }, "reject", "claude")).toMatchObject({ ok: true, status: "todo", round: 0 });
     expect(applyTransition({ status: "todo", round: 0 }, "invented" as TaskAction, "claude")).toMatchObject({ ok: false, error: { code: "unknown_action" } });
+    expect(applyTransition({ status: "review", round: 1 }, "requeue", "dispatcher", { lastRunOutcome: "failed" })).toMatchObject({ ok: false, error: { code: "requeue_requires_rate_limited" } });
+    expect(applyTransition({ status: "review", round: 1 }, "requeue", "dispatcher", { lastRunOutcome: "rate_limited" })).toMatchObject({ ok: true, status: "next" });
   });
 });
 
@@ -72,6 +76,12 @@ describe("canStart", () => {
 
     const waiting = canStart(task, { ...ready, questions: [{ id: "Q-1", decision_key: "api_shape", kind: "stop", status: "open" }] });
     expect(waiting).toEqual({ ok: false, reasons: [{ code: "waiting_answer", ids: ["Q-1"] }] });
+
+    const assumption = canStart(task, { ...ready, questions: [{ id: "Q-2", decision_key: "api_shape", kind: "assume", status: "open" }] });
+    expect(assumption).toEqual({ ok: true, reasons: [] });
+
+    const paused = canStart(task, { ...ready, pausedUntil: new Date(Date.now() + 60_000).toISOString() });
+    expect(paused).toMatchObject({ ok: false, reasons: [{ code: "paused", until: expect.any(String) }] });
 
     const noSlot = canStart(task, { ...ready, maxSlots: 5, runningTasks: Array.from({ length: 5 }, (_, index) => ({ id: `RUN-${index}`, allowed_files: [`other/${index}.ts`] })) });
     expect(noSlot).toEqual({ ok: false, reasons: [{ code: "no_slot" }] });

@@ -78,8 +78,21 @@ const repoRelativePath = z.string().min(1).refine((value) => {
 export const DataLinkSchema = z.object({
   from: absolutePath,
   to: repoRelativePath,
+  mode: z.enum(["copy", "link"]).default("copy"),
 });
 export type DataLink = z.infer<typeof DataLinkSchema>;
+
+export const BoardEventKindSchema = z.enum([
+  "ready",
+  "review",
+  "answer",
+  "assumption_rejected",
+  "stale",
+  "failed",
+  "paused",
+  "resumed",
+]);
+export type BoardEventKind = z.infer<typeof BoardEventKindSchema>;
 
 export const ExecutorConfigSchema = z.object({
   kind: z.literal("codex"),

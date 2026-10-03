@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import {
   DataLinkSchema,
+  BoardEventKindSchema,
   EventKindSchema,
   ExecutorAssumptionSchema,
   ExecutorConfigSchema,
@@ -99,7 +100,7 @@ function assertNoSanitizedValidationKeywords(value: unknown, path = "$source"): 
 
 describe("enum schemas", () => {
   test("accept listed values and reject unknown values", () => {
-    for (const schema of [TaskStatusSchema, RunOutcomeSchema, EventKindSchema, QuestionKindSchema, QuestionTargetSchema, GateStatusSchema]) {
+    for (const schema of [TaskStatusSchema, RunOutcomeSchema, EventKindSchema, BoardEventKindSchema, QuestionKindSchema, QuestionTargetSchema, GateStatusSchema]) {
       const accepted = schema.options[0];
       expect(schema.safeParse(accepted).success).toBe(true);
       expect(schema.safeParse("not-a-value").success).toBe(false);
@@ -132,6 +133,9 @@ describe("profile component schemas", () => {
 
   test("validates absolute source and repository-relative target paths", () => {
     expect(DataLinkSchema.safeParse({ from: "D:\\data\\input.db", to: "data/input.db" }).success).toBe(true);
+    expect(DataLinkSchema.parse({ from: "D:\\data\\input.db", to: "data/input.db" }).mode).toBe("copy");
+    expect(DataLinkSchema.parse({ from: "D:\\data\\input.db", to: "data/input.db", mode: "link" }).mode).toBe("link");
+    expect(DataLinkSchema.safeParse({ from: "D:\\data\\input.db", to: "data/input.db", mode: "shared" }).success).toBe(false);
     expect(DataLinkSchema.safeParse({ from: "relative/input.db", to: "C:\\data\\input.db" }).success).toBe(false);
     expect(DataLinkSchema.safeParse({ from: "/data/input.db", to: "../outside.db" }).success).toBe(false);
   });
