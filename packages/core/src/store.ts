@@ -33,6 +33,15 @@ import { parseCardFile } from "./cards";
 import { resolveHome } from "./home";
 import { applyTransition, canStart, type Actor, type TaskAction, type TransitionResult } from "./state-machine";
 import {
+  acquireMemoryLeaseInTransaction,
+  BYTES_PER_GB,
+  executorMemoryBytes,
+  freeMemoryBytes,
+  memoryLeasedBytes,
+  MemoryLeaseUnavailableError,
+  type AcquireMemoryLeaseInput,
+} from "./memory/ledger";
+import {
   approvals,
   boardEvents,
   decisions,
@@ -66,6 +75,8 @@ const defaultSettings = {
   tick_seconds: 3,
   paused_until: null as string | null,
   pause_backoff_minutes: 15,
+  memory_limit_gb: 16,
+  executor_memory_gb: 2,
 };
 
 export type BoardSettingKey = keyof typeof defaultSettings;
@@ -130,7 +141,8 @@ export function getSetting<K extends BoardSettingKey>(store: BoardStore, key: K)
 }
 
 export function setSetting<K extends BoardSettingKey>(store: BoardStore, key: K, value: typeof defaultSettings[K]): void {
-  if (key === "max_slots" || key === "stale_minutes" || key === "tick_seconds" || key === "pause_backoff_minutes") {
+  if (key === "max_slots" || key === "stale_minutes" || key === "tick_seconds" || key === "pause_backoff_minutes"
+    || key === "memory_limit_gb" || key === "executor_memory_gb") {
     if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
       throw new TypeError(`${key} must be a positive number`);
     }
@@ -138,6 +150,25 @@ export function setSetting<K extends BoardSettingKey>(store: BoardStore, key: K,
   }
   if (key === "paused_until" && value !== null && (typeof value !== "string" || Number.isNaN(Date.parse(value)))) {
     throw new TypeError("paused_until must be an ISO date or null");
+  }
+  if (key === "memory_limit_gb") {
+    const bytes = Math.floor((value as number) * BYTES_PER_GB);
+    if (!Number.isSafeInteger(bytes) || bytes <= 0) throw new TypeError(`${key} must represent at least one byte`);
+    store.sqlite.exec("BEGIN IMMEDIATE");
+    try {
+      if (bytes < memoryLeasedBytes(store)) throw new TypeError("memory_limit_gb cannot be lower than the active memory leases");
+      store.db.insert(settings).values({ key, value: jsonEncode(value) })
+        .onConflictDoUpdate({ target: settings.key, set: { value: jsonEncode(value) } }).run();
+      store.sqlite.exec("COMMIT");
+    } catch (error) {
+      try { store.sqlite.exec("ROLLBACK"); } catch { /* Preserve the original error. */ }
+      throw error;
+    }
+    return;
+  }
+  if (key === "executor_memory_gb") {
+    const bytes = Math.floor((value as number) * BYTES_PER_GB);
+    if (!Number.isSafeInteger(bytes) || bytes <= 0) throw new TypeError(`${key} must represent at least one byte`);
   }
   store.db.insert(settings).values({ key, value: jsonEncode(value) })
     .onConflictDoUpdate({ target: settings.key, set: { value: jsonEncode(value) } }).run();
@@ -796,6 +827,7 @@ export function createGateRun(store: BoardStore, input: CreateGateRunInput) {
     task: input.task,
     cmd: input.cmd,
     status: "queued",
+    exitCode: null,
     ramEstBytes: input.ram_est_bytes,
     peakCommitBytes: null,
     startedAt: null,
@@ -807,6 +839,7 @@ export function createGateRun(store: BoardStore, input: CreateGateRunInput) {
 
 export interface UpdateGateRunInput {
   status: GateStatus;
+  exit_code?: number | null;
   peak_commit_bytes?: number | null;
   started_at?: string | null;
   ended_at?: string | null;
@@ -814,6 +847,9 @@ export interface UpdateGateRunInput {
 
 export function updateGateRun(store: BoardStore, id: string, input: UpdateGateRunInput) {
   const status = GateStatusSchema.parse(input.status);
+  if (input.exit_code !== undefined && input.exit_code !== null && !Number.isInteger(input.exit_code)) {
+    throw new TypeError("exit_code must be an integer");
+  }
   if (input.peak_commit_bytes !== undefined && input.peak_commit_bytes !== null
     && (!Number.isInteger(input.peak_commit_bytes) || input.peak_commit_bytes < 0)) {
     throw new TypeError("peak_commit_bytes must be a non-negative integer");
@@ -822,12 +858,23 @@ export function updateGateRun(store: BoardStore, id: string, input: UpdateGateRu
   if (!current) throw new StoreNotFoundError("Gate run", id);
   const update = {
     status,
+    ...(input.exit_code !== undefined ? { exitCode: input.exit_code } : {}),
     ...(input.peak_commit_bytes !== undefined ? { peakCommitBytes: input.peak_commit_bytes } : {}),
     ...(input.started_at !== undefined ? { startedAt: input.started_at } : {}),
     ...(input.ended_at !== undefined ? { endedAt: input.ended_at } : {}),
   };
   store.db.update(gateRuns).set(update).where(eq(gateRuns.id, id)).run();
   return { ...current, ...update };
+}
+
+export function getGateRun(store: BoardStore, id: string) {
+  const row = store.db.select().from(gateRuns).where(eq(gateRuns.id, id)).get();
+  if (!row) throw new StoreNotFoundError("Gate run", id);
+  return row;
+}
+
+export function listGateRunsForTask(store: BoardStore, taskId: string) {
+  return store.db.select().from(gateRuns).where(eq(gateRuns.task, taskId)).orderBy(asc(gateRuns.startedAt), asc(gateRuns.id)).all();
 }
 
 export function updateGateStats(store: BoardStore, project: string, cmdHash: string, peakCommitBytes: number) {
@@ -894,10 +941,20 @@ export function canStartTask(store: BoardStore, id: string) {
     runningTasks: runningRows,
     maxSlots: getSetting(store, "max_slots"),
     pausedUntil: getSetting(store, "paused_until"),
+    requestedMemoryBytes: executorMemoryBytes(store),
+    freeMemoryBytes: freeMemoryBytes(store),
   });
 }
 
-export function transitionTask(store: BoardStore, id: string, action: TaskAction, actor: Actor, maxSlots?: number, note?: string): StoredTask {
+export function transitionTask(
+  store: BoardStore,
+  id: string,
+  action: TaskAction,
+  actor: Actor,
+  maxSlots?: number,
+  note?: string,
+  memoryLease?: AcquireMemoryLeaseInput,
+): StoredTask {
   store.sqlite.exec("BEGIN IMMEDIATE");
   try {
     const task = getTask(store, id);
@@ -921,11 +978,21 @@ export function transitionTask(store: BoardStore, id: string, action: TaskAction
           allowed_files: parseJson(row.allowedFiles, TaskCardSchema.shape.allowed_files, "tasks.allowed_files"),
         })),
         pausedUntil: getSetting(store, "paused_until"),
+        requestedMemoryBytes: executorMemoryBytes(store),
+        freeMemoryBytes: freeMemoryBytes(store),
       });
     }
     if (action === "requeue") transitionContext.lastRunOutcome = listRunsForTask(store, id).at(-1)?.outcome ?? null;
     const result = applyTransition(task, action, actor, transitionContext);
     if (!result.ok) throw new IllegalTaskTransitionError(result);
+
+    if ((action === "start" || action === "resume") && memoryLease) {
+      const reservation = memoryLease.kind === "executor"
+        ? { ...memoryLease, bytes: executorMemoryBytes(store) }
+        : memoryLease;
+      const acquired = acquireMemoryLeaseInTransaction(store, reservation);
+      if (!acquired.acquired) throw new MemoryLeaseUnavailableError(acquired.requestedBytes, acquired.freeBytes);
+    }
 
     let prio = task.prio;
     if (action === "owner_answered") {

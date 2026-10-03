@@ -1,7 +1,7 @@
 import { parseArgs } from "node:util";
 import { existsSync, readFileSync } from "node:fs";
 import { BoardEventKindSchema, ExecutorQuestionSchema, TaskCardSchema, type BoardEventKind } from "@agent-board/contracts";
-import { answerQuestion, addProject, addTask, canStartTask, closeStore, createEpic, createQuestion, getEpic, getProject, getQuestion, getRun, getTask, IllegalTaskTransitionError, listEventsAfter, listEpics, listQuestions, listRecentBoardEvents, listRunsForTask, listSettings, listTaskLog, listTasks, listTasksByEpic, openStore, serveDispatcher, setSetting, setTaskPriority, transitionTask, waitForBoardEvents } from "@agent-board/core";
+import { answerQuestion, addProject, addTask, canStartTask, closeStore, createEpic, createQuestion, getEpic, getProject, getQuestion, getRun, getTask, IllegalTaskTransitionError, listEventsAfter, listEpics, listQuestions, listRecentBoardEvents, listRunsForTask, listSettings, listTaskLog, listTasks, listTasksByEpic, openStore, serveDispatcher, setSetting, setTaskPriority, transitionTask, waitForBoardEvents, gateInternal, runGates, memoryStatus, MemoryLeaseUnavailableError } from "@agent-board/core";
 import { AcceptanceRefusedError, acceptTask, rejectTask, reviewSummary } from "@agent-board/core";
 import { resumeTask, runInternal, startTask, stopTask } from "@agent-board/core";
 import { ensureEpicWorktree, epicBranchName, getEpicWorktreePath } from "@agent-board/core";
@@ -116,6 +116,8 @@ const allCommandUsage = [
   "Usage: agentctl status [--epic <id>] [--json]",
   "Usage: agentctl wait --for <kind,...> [--after <seq>] [--timeout <seconds>] [--json]",
   "Usage: agentctl serve [--once]",
+  "Usage: agentctl gate <task-id> [--json]",
+  "Usage: agentctl memory [--json]",
   "Usage: agentctl settings [--set key=value]...",
   "Usage: agentctl log <task-id> [--follow] [--raw] [--json]",
 ].filter(Boolean).join("\n");
@@ -302,6 +304,16 @@ async function dispatch(store: BoardStore, positionals: string[], options: CliOp
     emit(result, options.json, `Resumed ${result.task}; run ${result.run_id} is running in the background.`);
     return;
   }
+  if (command === "gate") {
+    const taskId = required(subcommand, "task id");
+    const gates = await runGates(store, taskId, ({ cmd, reason }) => {
+      process.stderr.write(`Gate queued (${cmd}): waiting for memory lease; ${reason}.\n`);
+    });
+    const failed = gates.some((gate) => gate.status === "fail" || gate.status === "oom");
+    const human = gates.map((gate) => `${gate.cmd}: ${gate.status} (exit ${gate.exit_code ?? "?"}, peak ${gate.peak_commit_bytes === null ? "unknown" : `${(gate.peak_commit_bytes / (1024 * 1024)).toFixed(0)} MB`}, ${gate.log_path})`).join("\n") || "No gates configured.";
+    emit(gates, options.json, human);
+    return failed ? 2 : 0;
+  }
   if (command === "stop") {
     const result = stopTask(store, required(subcommand, "task id"));
     emit(result, options.json, `Stopped ${result.task}; it is ready for review.`);
@@ -401,13 +413,22 @@ async function dispatch(store: BoardStore, positionals: string[], options: CliOp
     emit({ running: !options.once }, options.json, options.once ? "Dispatcher tick completed." : "Dispatcher stopped.");
     return;
   }
+  if (command === "memory") {
+    const snapshot = memoryStatus(store);
+    const human = [
+      `limit ${(snapshot.limit_bytes / (1024 ** 3)).toFixed(2)} GB; used ${(snapshot.used_bytes / (1024 ** 3)).toFixed(2)} GB; free ${(snapshot.free_bytes / (1024 ** 3)).toFixed(2)} GB`,
+      ...snapshot.leases.map((lease) => `${lease.kind} ${lease.ref}: ${(lease.bytes / (1024 ** 2)).toFixed(0)} MB${lease.pid === null ? " (starting)" : ` (pid ${lease.pid})`}`),
+    ].join("\n");
+    emit(snapshot, options.json, human);
+    return;
+  }
   if (command === "settings") {
     for (const assignment of options.set ?? []) {
       const separator = assignment.indexOf("=");
       if (separator < 1) throw new TypeError("Settings use --set key=value");
       const key = assignment.slice(0, separator);
       const rawValue = assignment.slice(separator + 1);
-      if (!Object.hasOwn({ max_slots: 1, stale_minutes: 1, tick_seconds: 1, paused_until: 1, pause_backoff_minutes: 1 }, key)) {
+      if (!Object.hasOwn({ max_slots: 1, stale_minutes: 1, tick_seconds: 1, paused_until: 1, pause_backoff_minutes: 1, memory_limit_gb: 1, executor_memory_gb: 1 }, key)) {
         throw new TypeError(`Unknown setting: ${key}`);
       }
       let value: unknown;
@@ -452,6 +473,10 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
       await runInternal(required(parsed.positionals[1], "run id"));
       return 0;
     }
+    if (parsed.positionals[0] === "_gate") {
+      await gateInternal(required(parsed.positionals[1], "gate run id"));
+      return 0;
+    }
     const store = openStore();
     try {
       const result = await dispatch(store, parsed.positionals, options);
@@ -460,7 +485,7 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
       closeStore(store);
     }
   } catch (error) {
-    const refused = error instanceof CliRefusal || error instanceof AcceptanceRefusedError || error instanceof IllegalTaskTransitionError;
+    const refused = error instanceof CliRefusal || error instanceof AcceptanceRefusedError || error instanceof IllegalTaskTransitionError || error instanceof MemoryLeaseUnavailableError;
     const code = refused ? 2 : 1;
     const transitionDetails = error instanceof IllegalTaskTransitionError ? error.transition.error : undefined;
     const message = error instanceof Error ? error.message : String(error);

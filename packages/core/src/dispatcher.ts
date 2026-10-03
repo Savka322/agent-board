@@ -4,6 +4,7 @@ import type { RunOutcome } from "@agent-board/contracts";
 import {
   canStartTask,
   emitBoardEvent,
+  getGateRun,
   getInternalSetting,
   getLatestRunEvent,
   getTask,
@@ -16,7 +17,9 @@ import {
   finishRun,
   transitionTask,
   type BoardStore,
+  updateGateRun,
 } from "./store";
+import { cleanupDeadMemoryLeases } from "./memory/ledger";
 
 export interface DispatcherTickResult {
   ready: string[];
@@ -139,6 +142,13 @@ export function dispatchTick(store: BoardStore, options: DispatcherOptions = {})
   const isAlive = options.isAlive ?? isProcessAlive;
   const staleLimitMs = getSetting(store, "stale_minutes") * 60_000;
   const result: DispatcherTickResult = { ready: [], stale: [], failed: [], paused: [], resumed: false };
+
+  for (const lease of cleanupDeadMemoryLeases(store, isAlive)) {
+    if (lease.kind === "gate") {
+      const gateRun = getGateRun(store, lease.ref);
+      if (gateRun.status === "running") updateGateRun(store, lease.ref, { status: "fail", exit_code: 1, ended_at: now.toISOString() });
+    }
+  }
 
   for (const task of listTasksByStatus(store, "running")) {
     const run = listRunsForTask(store, task.id).at(-1);

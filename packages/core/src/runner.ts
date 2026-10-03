@@ -24,6 +24,13 @@ import {
   transitionTask,
   writeTaskLog,
 } from "./store";
+import {
+  executorMemoryBytes,
+  getMemoryLeaseByRef,
+  releaseMemoryLease,
+  setMemoryLeasePid,
+} from "./memory/ledger";
+import { resourceLimiter, type ResourceLimitSession } from "./memory";
 import { ensureTaskWorktree, getTaskWorktreePath } from "./worktrees";
 
 export interface StartResult {
@@ -71,6 +78,8 @@ function spawnDetachedRunner(runId: string): StartResult["pid"] {
     stdio: "ignore",
     env: process.env,
   });
+  child.once("error", () => {});
+  if (child.pid === undefined) throw new Error("Could not start the executor runner process");
   child.unref();
   return child.pid;
 }
@@ -79,7 +88,14 @@ export function startTask(store: ReturnType<typeof openStore>, taskId: string): 
   const currentTask = getTask(store, taskId);
   const epic = getEpic(store, currentTask.epic);
   const profile = getProject(store, epic.project).profile;
-  const task = transitionTask(store, taskId, "start", "claude");
+  const runId = crypto.randomUUID();
+  const leaseBytes = executorMemoryBytes(store);
+  const task = transitionTask(store, taskId, "start", "claude", undefined, undefined, {
+    id: runId,
+    kind: "executor",
+    ref: runId,
+    bytes: leaseBytes,
+  });
   let files: RunFiles;
   let prompt: string;
   try {
@@ -88,16 +104,26 @@ export function startTask(store: ReturnType<typeof openStore>, taskId: string): 
     if (existsSync(files.directory)) throw new Error(`Run directory already exists for ${taskId} round ${task.round}`);
     prompt = buildPrompt({ profile, card: task.card, decisions: listAnsweredDecisionsForTask(store, taskId) });
   } catch (error) {
+    releaseMemoryLease(store, runId);
     transitionTask(store, taskId, "run_finished", "runner");
     throw error;
   }
-  const run = createRun(store, { task: taskId, round: task.round, executor: profile.executor.model, reportPath: files.report, rawPath: files.raw });
+  let run: ReturnType<typeof createRun>;
+  try {
+    run = createRun(store, { id: runId, task: taskId, round: task.round, executor: profile.executor.model, reportPath: files.report, rawPath: files.raw });
+  } catch (error) {
+    releaseMemoryLease(store, runId);
+    transitionTask(store, taskId, "run_finished", "runner");
+    throw error;
+  }
   try {
     writePromptAndSchema(files, prompt);
     const pid = spawnDetachedRunner(run.id);
     if (pid !== undefined) setRunPid(store, run.id, pid);
+    if (pid !== undefined) setMemoryLeasePid(store, run.id, pid);
     return { run_id: run.id, task: taskId, round: run.round, pid };
   } catch (error) {
+    releaseMemoryLease(store, run.id);
     finishRun(store, run.id, { outcome: "failed", exitCode: 1 });
     transitionTask(store, taskId, "run_finished", "runner");
     emitBoardEvent(store, { kind: "review", task: taskId, run: run.id, payload: "failed" }, { run: run.id });
@@ -113,7 +139,14 @@ export function resumeTask(store: ReturnType<typeof openStore>, taskId: string, 
   if (!prior?.sessionId) throw new Error(`Task ${taskId} has no previous Codex session to resume`);
   const epic = getEpic(store, task.epic);
   const profile = getProject(store, epic.project).profile;
-  const runningTask = transitionTask(store, taskId, "resume", "claude", undefined, notePath);
+  const runId = crypto.randomUUID();
+  const leaseBytes = executorMemoryBytes(store);
+  const runningTask = transitionTask(store, taskId, "resume", "claude", undefined, notePath, {
+    id: runId,
+    kind: "executor",
+    ref: runId,
+    bytes: leaseBytes,
+  });
   let files: RunFiles;
   let prompt: string;
   try {
@@ -122,17 +155,27 @@ export function resumeTask(store: ReturnType<typeof openStore>, taskId: string, 
     if (existsSync(files.directory)) throw new Error(`Run directory already exists for ${taskId} round ${runningTask.round}`);
     prompt = buildResumePrompt(note, listAnsweredDecisionsForTask(store, taskId));
   } catch (error) {
+    releaseMemoryLease(store, runId);
     transitionTask(store, taskId, "run_finished", "runner");
     throw error;
   }
-  const run = createRun(store, { task: taskId, round: runningTask.round, executor: profile.executor.model, reportPath: files.report, rawPath: files.raw });
+  let run: ReturnType<typeof createRun>;
+  try {
+    run = createRun(store, { id: runId, task: taskId, round: runningTask.round, executor: profile.executor.model, reportPath: files.report, rawPath: files.raw });
+  } catch (error) {
+    releaseMemoryLease(store, runId);
+    transitionTask(store, taskId, "run_finished", "runner");
+    throw error;
+  }
   try {
     writePromptAndSchema(files, prompt);
     writeFileSync(files.note, note, "utf8");
     const pid = spawnDetachedRunner(run.id);
     if (pid !== undefined) setRunPid(store, run.id, pid);
+    if (pid !== undefined) setMemoryLeasePid(store, run.id, pid);
     return { run_id: run.id, task: taskId, round: run.round, pid };
   } catch (error) {
+    releaseMemoryLease(store, run.id);
     finishRun(store, run.id, { outcome: "failed", exitCode: 1 });
     transitionTask(store, taskId, "run_finished", "runner");
     emitBoardEvent(store, { kind: "review", task: taskId, run: run.id, payload: "failed" }, { run: run.id });
@@ -203,7 +246,7 @@ function readReport(path: string): ExecutorReport | null {
   }
 }
 
-async function runExecutor(store: ReturnType<typeof openStore>, runId: string): Promise<void> {
+async function runExecutor(store: ReturnType<typeof openStore>, runId: string, resourceSession: ResourceLimitSession, leaseBytes: number): Promise<void> {
   const run = getRun(store, runId);
   const task = getTask(store, run.task);
   const epic = getEpic(store, task.epic);
@@ -224,6 +267,8 @@ async function runExecutor(store: ReturnType<typeof openStore>, runId: string): 
   let seq = 0;
   let usage: unknown | null = null;
   let rateLimitSignatureDetected = false;
+  let memoryLimitMessage = false;
+  let memoryErrorSignatureDetected = false;
   let eventBatch: Array<{ ts: string; kind: "think" | "read" | "exec" | "edit" | "test_pass" | "test_fail" | "message" | "question" | "error" | "unknown"; text: string; raw_line: number }> = [];
   let consumerError: Error | null = null;
 
@@ -251,6 +296,11 @@ async function runExecutor(store: ReturnType<typeof openStore>, runId: string): 
     if (eventBatch.length >= 100) flushEvents();
   };
   const interval = setInterval(() => {
+    if (!memoryLimitMessage && resourceSession.pollMemoryLimit()) {
+      memoryLimitMessage = true;
+      eventBatch.push({ ts: new Date().toISOString(), kind: "error", text: `executor hit its memory lease (${Math.ceil(leaseBytes / (1024 * 1024))} MB)`, raw_line: rawLine });
+      seq += 1;
+    }
     try { flushEvents(); } catch (error) {
       consumerError = error instanceof Error ? error : new Error(String(error));
       child.kill();
@@ -271,6 +321,7 @@ async function runExecutor(store: ReturnType<typeof openStore>, runId: string): 
   });
   child.stderr.on("data", (chunk: string) => {
     stderrOutput.write(chunk);
+    if (/out of memory|memoryerror|std::bad_alloc/i.test(`${stderrTail}${chunk}`)) memoryErrorSignatureDetected = true;
     // This deliberately requires a rate-limit phrase or a contextual 429 to avoid tool output false positives.
     if (/rate[ _-]?limit|usage limit|too many requests|\b429\b[^\n]*(too many|rate)|status(?: code)?[: ]+429/i.test(`${stderrTail}${chunk}`)) {
       rateLimitSignatureDetected = true;
@@ -285,6 +336,11 @@ async function runExecutor(store: ReturnType<typeof openStore>, runId: string): 
       child.once("error", rejectPromise);
       child.once("close", (code) => resolvePromise(code ?? 1));
     });
+    if (!memoryLimitMessage && resourceSession.pollMemoryLimit()) {
+      memoryLimitMessage = true;
+      eventBatch.push({ ts: new Date().toISOString(), kind: "error", text: `executor hit its memory lease (${Math.ceil(leaseBytes / (1024 * 1024))} MB)`, raw_line: rawLine });
+      seq += 1;
+    }
     if (pendingStdout.length > 0) normalizeLine(pendingStdout);
   } catch (error) {
     consumerError = error instanceof Error ? error : new Error(String(error));
@@ -294,6 +350,12 @@ async function runExecutor(store: ReturnType<typeof openStore>, runId: string): 
     rawOutput.end();
     stderrOutput.end();
     await Promise.all([new Promise<void>((resolvePromise) => rawOutput.once("finish", resolvePromise)), new Promise<void>((resolvePromise) => stderrOutput.once("finish", resolvePromise))]);
+  }
+
+  if (!memoryLimitMessage && exitCode !== 0 && memoryErrorSignatureDetected) {
+    memoryLimitMessage = true;
+    eventBatch.push({ ts: new Date().toISOString(), kind: "error", text: `executor hit its memory lease (${Math.ceil(leaseBytes / (1024 * 1024))} MB)`, raw_line: rawLine });
+    seq += 1;
   }
 
   const report = consumerError ? null : readReport(files.report);
@@ -340,8 +402,14 @@ async function runExecutor(store: ReturnType<typeof openStore>, runId: string): 
 /** Entry point for the hidden CLI worker process. */
 export async function runInternal(runId: string): Promise<void> {
   const store = openStore();
+  let resourceSession: ResourceLimitSession | undefined;
+  let leaseId: string | undefined;
   try {
-    await runExecutor(store, runId);
+    const lease = getMemoryLeaseByRef(store, "executor", runId);
+    if (!lease) throw new Error(`Executor memory lease not found for run ${runId}`);
+    leaseId = lease.id;
+    resourceSession = resourceLimiter.create(lease.bytes);
+    await runExecutor(store, runId, resourceSession, lease.bytes);
   } catch (error) {
     try {
       const run = getRun(store, runId);
@@ -355,6 +423,9 @@ export async function runInternal(runId: string): Promise<void> {
     }
     throw error;
   } finally {
-    closeStore(store);
+    try { resourceSession?.dispose(); } finally {
+      if (leaseId) releaseMemoryLease(store, leaseId);
+      closeStore(store);
+    }
   }
 }

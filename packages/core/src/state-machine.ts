@@ -31,6 +31,8 @@ export interface CanStartContext {
   runningTasks?: Array<{ id: string; allowed_files: string[] }>;
   maxSlots?: number;
   pausedUntil?: string | null;
+  requestedMemoryBytes?: number;
+  freeMemoryBytes?: number;
 }
 
 export type CanStartReason =
@@ -38,7 +40,8 @@ export type CanStartReason =
   | { code: "waiting_answer"; ids: string[] }
   | { code: "no_slot" }
   | { code: "paused"; until: string }
-  | { code: "file_overlap"; ids: string[] };
+  | { code: "file_overlap"; ids: string[] }
+  | { code: "no_memory"; requested_bytes: number; free_bytes: number };
 
 export type CanStartResult = { ok: true; reasons: [] } | { ok: false; reasons: CanStartReason[] };
 
@@ -73,6 +76,11 @@ export function canStart(task: StartTask, ctx: CanStartContext = {}): CanStartRe
 
   if (ctx.pausedUntil && Date.parse(ctx.pausedUntil) > Date.now()) {
     reasons.push({ code: "paused", until: ctx.pausedUntil });
+  }
+
+  if (ctx.requestedMemoryBytes !== undefined && ctx.freeMemoryBytes !== undefined
+    && ctx.requestedMemoryBytes > ctx.freeMemoryBytes) {
+    reasons.push({ code: "no_memory", requested_bytes: ctx.requestedMemoryBytes, free_bytes: ctx.freeMemoryBytes });
   }
 
   const running = (ctx.runningTasks ?? []).filter((other) => other.id !== task.id);

@@ -2,6 +2,8 @@ export * from "./cards";
 export * from "./codex-normalizer";
 export * from "./dispatcher";
 export * from "./home";
+export * from "./gates";
+export * from "./memory";
 export * from "./prompts";
 export * from "./review";
 export * from "./runner";
