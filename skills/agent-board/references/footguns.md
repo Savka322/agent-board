@@ -10,6 +10,7 @@ Verified on Windows 11 with Codex CLI 0.159 and Bun 1.4.
 
 ## Codex CLI
 
+- The `workspace-write` sandbox has no network. A card cannot ask the executor to install packages, and `bun install` / `pip install` inside a run fails. Install dependencies before the epic and bring them into worktrees through `data_links` or an interpreter outside the repo.
 - Without stdin (`-` or `</dev/null`) `codex exec` waits for input forever.
 - `codex exec resume <session>` has no `-s` flag; set the sandbox with `-c sandbox_mode=workspace-write`.
 - Without `-c model_reasoning_summary=concise` the stream has no reasoning items, so the board's live log shows no "think" lines.

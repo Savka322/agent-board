@@ -264,6 +264,14 @@ export function dispatchTick(store: BoardStore, options: DispatcherOptions = {})
   return result;
 }
 
+/** Whether an `agentctl serve` process holds this home's lock. */
+export function dispatcherStatus(store: BoardStore, isAlive: (pid: number) => boolean = isProcessAlive): { running: boolean; pid: number | null } {
+  let contents = "";
+  try { contents = readFileSync(join(store.home, "serve.lock"), "utf8").trim(); } catch { return { running: false, pid: null }; }
+  const pid = /^\d+$/.test(contents) ? Number(contents) : null;
+  return pid !== null && isAlive(pid) ? { running: true, pid } : { running: false, pid: null };
+}
+
 export function acquireServeLock(store: BoardStore): () => void {
   const lockPath = join(store.home, "serve.lock");
   const ownPid = process.pid;

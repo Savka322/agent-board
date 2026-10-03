@@ -21,7 +21,7 @@ import {
   transitionTask,
   type BoardStore,
 } from "../src/store";
-import { acquireServeLock, dispatchTick } from "../src/dispatcher";
+import { acquireServeLock, dispatcherStatus, dispatchTick } from "../src/dispatcher";
 import { waitForBoardEvents } from "../src/wait";
 import type { TaskCard } from "@agent-board/contracts";
 import { installFreshHome, writeProfile } from "./helpers";
@@ -199,5 +199,15 @@ describe("board events and dispatcher", () => {
     expect(existsSync(lockPath)).toBe(true);
     releaseStale();
     expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test("dispatcher status reports the live lock holder only", () => {
+    const store = setupTasks();
+    expect(dispatcherStatus(store)).toEqual({ running: false, pid: null });
+    const release = acquireServeLock(store);
+    expect(dispatcherStatus(store)).toEqual({ running: true, pid: process.pid });
+    release();
+    writeFileSync(join(store.home, "serve.lock"), "2147483647\n", "utf8");
+    expect(dispatcherStatus(store)).toEqual({ running: false, pid: null });
   });
 });

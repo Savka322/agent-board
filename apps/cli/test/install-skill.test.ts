@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { installSkill, SkillInstallRefusalError } from "../src/install-skill";
+import { AGENTCTL_PLACEHOLDER, defaultAgentctlCommand, installSkill, SkillInstallRefusalError } from "../src/install-skill";
 
 let temporary = "";
 
@@ -34,5 +34,30 @@ describe("agentctl install-skill", () => {
     const result = installSkill({ source, target, force: true });
     expect(result.alreadyCurrent).toBe(false);
     expect(readFileSync(join(target, "SKILL.md"), "utf8")).toBe("repository skill\n");
+  });
+
+  test("writes the agentctl command into Markdown files and treats it as part of the contents", () => {
+    temporary = mkdtempSync(join(tmpdir(), "agent-board-skill-test-"));
+    const target = join(temporary, "agent-board");
+    const source = join(temporary, "source");
+    mkdirSync(join(source, "references"), { recursive: true });
+    writeFileSync(join(source, "SKILL.md"), `Run ${AGENTCTL_PLACEHOLDER} status\n`, "utf8");
+    writeFileSync(join(source, "references", "notes.md"), `${AGENTCTL_PLACEHOLDER} wait\n`, "utf8");
+    installSkill({ source, target, command: "bun \"C:/board/index.ts\"" });
+    expect(readFileSync(join(target, "SKILL.md"), "utf8")).toBe("Run bun \"C:/board/index.ts\" status\n");
+    expect(readFileSync(join(target, "references", "notes.md"), "utf8")).toBe("bun \"C:/board/index.ts\" wait\n");
+    expect(installSkill({ source, target, command: "bun \"C:/board/index.ts\"" }).alreadyCurrent).toBe(true);
+    expect(() => installSkill({ source, target, command: "bun \"D:/moved/index.ts\"" })).toThrow(SkillInstallRefusalError);
+  });
+
+  test("the default command points at an existing CLI entry", () => {
+    const command = defaultAgentctlCommand();
+    expect(command.startsWith("bun \"")).toBe(true);
+    expect(existsSync(command.slice("bun \"".length, -1))).toBe(true);
+  });
+
+  test("the repository skill calls agentctl through the placeholder", () => {
+    const skill = readFileSync(join(import.meta.dir, "../../../skills/agent-board/SKILL.md"), "utf8");
+    expect(skill).toContain(AGENTCTL_PLACEHOLDER);
   });
 });

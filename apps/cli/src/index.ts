@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BoardEventKindSchema, ExecutorQuestionSchema, TaskCardSchema, type BoardEventKind } from "@agent-board/contracts";
-import { answerQuestionAndTransition, addProject, addTask, canStartTask, cancelTask, closeStore, createEpic, createQuestion, EpicMergeRefusalError, getEpic, getProject, getRun, getSetting, getTask, IllegalTaskTransitionError, listEventsAfter, listEpics, listQuestions, listRecentBoardEvents, listRunsForTask, listSettings, listTaskLog, listTasks, listTasksByEpic, mergeEpic, openStore, serveDispatcher, setSetting, setTaskPriority, transitionTask, waitForBoardEvents, gateInternal, runGates, memoryStatus, MemoryLeaseUnavailableError, RuleRefusalError, hasWebMergeApproval, notifyCause, installNotificationApp, uninstallNotificationApp } from "@agent-board/core";
+import { answerQuestionAndTransition, addProject, addTask, canStartTask, cancelTask, closeStore, createEpic, createQuestion, dispatcherStatus, EpicMergeRefusalError, getEpic, getProject, getRun, getSetting, getTask, IllegalTaskTransitionError, listEventsAfter, listEpics, listQuestions, listRecentBoardEvents, listRunsForTask, listSettings, listTaskLog, listTasks, listTasksByEpic, mergeEpic, openStore, serveDispatcher, setSetting, setTaskPriority, transitionTask, waitForBoardEvents, gateInternal, runGates, memoryStatus, MemoryLeaseUnavailableError, RuleRefusalError, hasWebMergeApproval, notifyCause, installNotificationApp, uninstallNotificationApp } from "@agent-board/core";
 import { AcceptanceRefusedError, acceptTask, rejectTask, reviewSummary } from "@agent-board/core";
 import { resumeTask, runInternal, startTask, stopTask } from "@agent-board/core";
 import { ensureEpicWorktree, epicBranchName, getEpicWorktreePath } from "@agent-board/core";
@@ -442,15 +442,17 @@ async function dispatch(store: BoardStore, positionals: string[], options: CliOp
     return;
   }
   if (command === "status") {
+    const dispatcher = dispatcherStatus(store);
+    const dispatcherLine = dispatcher.running ? `Dispatcher: running (pid ${dispatcher.pid})` : "Dispatcher: NOT running (start agentctl serve)";
     if (options.epic) {
       const epic = getEpic(store, options.epic);
       const tasks = compactStatus(store, listTasksByEpic(store, epic.id));
-      const result = { epic: { id: epic.id, title: epic.title, status: epic.status }, tasks };
-      emit(result, options.json, `${epic.id}: ${tasks.length} task(s)\n${humanStatus(tasks)}`);
+      const result = { dispatcher, epic: { id: epic.id, title: epic.title, status: epic.status }, tasks };
+      emit(result, options.json, `${dispatcherLine}\n${epic.id}: ${tasks.length} task(s)\n${humanStatus(tasks)}`);
     } else {
       const tasks = compactStatus(store, listTasks(store));
-      const result = { epics: listEpics(store).map(({ id, title, status }) => ({ id, title, status })), tasks };
-      emit(result, options.json, `${result.epics.length} epic(s), ${tasks.length} task(s)\n${humanStatus(tasks)}`);
+      const result = { dispatcher, epics: listEpics(store).map(({ id, title, status }) => ({ id, title, status })), tasks };
+      emit(result, options.json, `${dispatcherLine}\n${result.epics.length} epic(s), ${tasks.length} task(s)\n${humanStatus(tasks)}`);
     }
     return;
   }
@@ -513,7 +515,7 @@ async function dispatch(store: BoardStore, positionals: string[], options: CliOp
   if (command === "install-skill") {
     const result = installSkill({ target: options.target, force: options.force });
     const action = result.alreadyCurrent ? "Already up to date at" : "Copied agent-board skill to";
-    emit(result, options.json, `${action} ${result.target}:\n${result.files.map((path) => `  ${path}`).join("\n")}`);
+    emit(result, options.json, `${action} ${result.target}:\n${result.files.map((path) => `  ${path}`).join("\n")}\nThe skill calls agentctl as: ${result.command}`);
     return;
   }
   if (command === "memory") {
