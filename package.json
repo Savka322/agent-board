@@ -6,7 +6,10 @@
   "scripts": {
     "agentctl": "bun apps/cli/src/index.ts",
     "test": "bun test",
-    "typecheck": "tsc -b"
+    "typecheck": "tsc -b && tsc --noEmit -p apps/web/tsconfig.json",
+    "web:dev": "bun run --cwd apps/web dev",
+    "web:build": "bun run --cwd apps/web build",
+    "web:serve": "bun apps/server/src/main.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",
