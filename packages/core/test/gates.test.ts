@@ -34,9 +34,9 @@ function command(mode: string, name: string): string {
   return `${quote(process.execPath)} ${quote(join(repo, "gate-work.ts"))} ${mode} ${name}`;
 }
 
-function runGateCli() {
+function runGateCli(json = true) {
   const entrypoint = join(import.meta.dir, "../../../apps/cli/src/index.ts");
-  return spawnSync(process.execPath, [entrypoint, "gate", "GATE-1", "--json"], {
+  return spawnSync(process.execPath, [entrypoint, "gate", "GATE-1", ...(json ? ["--json"] : [])], {
     cwd: process.cwd(),
     env: process.env,
     windowsHide: true,
@@ -73,11 +73,16 @@ function setup(): void {
   run("git", ["init", "-b", "main", repo], tempRoot);
   writeFileSync(join(repo, "README.md"), "temporary gates integration repo\n", "utf8");
   writeFileSync(join(repo, "gate-work.ts"), [
-    'import { appendFileSync } from "node:fs";',
+    'import { appendFileSync, readFileSync } from "node:fs";',
     'const [mode, name] = process.argv.slice(2);',
     'const marker = process.env.AGENT_BOARD_GATE_MARKERS!;',
     'appendFileSync(marker, `start:${name}:${Date.now()}\\n`);',
-    'if (mode === "oom" && process.platform === "win32") {',
+    'if (mode === "oom-once" && readFileSync(marker, "utf8").split("\\n").filter((line) => line.startsWith(`start:${name}:`)).length === 1) {',
+    '  console.error("MemoryError");',
+    '  process.exitCode = 2;',
+    '} else if (mode === "oom-once") {',
+    '  await Bun.sleep(100);',
+    '} else if (mode === "oom" && process.platform === "win32") {',
     '  const held: Uint8Array[] = [];',
     '  try {',
     '    for (let index = 0; index < 48; index += 1) {',
@@ -85,7 +90,7 @@ function setup(): void {
     '      for (let offset = 0; offset < block.length; offset += 4096) block[offset] = 1;',
     '      held.push(block);',
     '    }',
-    '  } catch (error) { console.error(error); process.exitCode = 2; }',
+    '  } catch (error) { console.error(error); process.exit(2); }',
     '} else if (mode === "oom") {',
     '  console.error("Out of memory");',
     '  process.exitCode = 2;',
@@ -155,7 +160,7 @@ describe("memory-limited gate launcher", () => {
     ]);
     const cli = runGateCli();
     expect(cli.status).toBe(0);
-    const result = JSON.parse(cli.stdout) as Array<{ id: string; cmd: string; status: string }>;
+    const result = JSON.parse(cli.stdout) as Array<{ id: string; cmd: string; status: string; attempts: unknown[] }>;
     expect(cli.stderr).toContain("Gate queued");
     expect(cli.stderr).toContain("needs 512 MB");
     expect(result.find(({ cmd }) => cmd.includes("first"))?.status).toBe("pass");
@@ -181,12 +186,34 @@ describe("memory-limited gate launcher", () => {
     ]);
     const cli = runGateCli();
     expect(cli.status).toBe(2);
-    const result = JSON.parse(cli.stdout) as Array<{ id: string; cmd: string; status: string; exit_code: number | null; peak_commit_bytes: number | null }>;
+    const result = JSON.parse(cli.stdout) as Array<{
+      id: string;
+      cmd: string;
+      status: string;
+      exit_code: number | null;
+      peak_commit_bytes: number | null;
+      attempts: Array<{
+        id: string;
+        attempt: number;
+        retry_of: string | null;
+        status: string;
+        lease_bytes: number | null;
+        peak_commit_bytes: number | null;
+        log_path: string;
+      }>;
+    }>;
     const oomResult = result.find(({ cmd }) => cmd.includes("oom"))!;
     expect(oomResult.status).toBe("oom");
+    expect(oomResult.attempts).toHaveLength(2);
+    expect(oomResult.attempts[0]).toMatchObject({ attempt: 1, retry_of: null, status: "oom", lease_bytes: 512 * BYTES_PER_MB });
+    expect(oomResult.attempts[1]).toMatchObject({ attempt: 2, retry_of: oomResult.id, status: "oom", lease_bytes: 512 * BYTES_PER_MB });
+    for (const attempt of oomResult.attempts) {
+      expect(readFileSync(attempt.log_path, "utf8")).toMatch(/gate classification signal=(port:10|stderr:.+) status=oom/);
+    }
     expect(result.find(({ cmd }) => cmd.includes("peer"))?.status).toBe("pass");
     expect(result.find(({ cmd }) => cmd.includes("fail"))?.status).toBe("fail");
     expect((store!.sqlite.query("SELECT COUNT(*) AS count FROM memory_leases").get() as { count: number }).count).toBe(0);
+    expect(listGateRunsForTask(store!, "GATE-1")).toHaveLength(4);
     expect(result.find(({ cmd }) => cmd.includes("oom"))?.exit_code).not.toBe(0);
     expect(result.find(({ cmd }) => cmd.includes("fail"))?.exit_code).toBe(1);
     expect(cli.stderr).toContain("needs 512 MB");
@@ -198,6 +225,9 @@ describe("memory-limited gate launcher", () => {
       expect(passing.peak_commit_bytes).toBeGreaterThan(0);
       const hash = createHash("sha256").update(passing.cmd, "utf8").digest("hex");
       expect(getGateStats(store!, "sample", hash).peakCommitMaxBytes).toBe(passing.peak_commit_bytes);
+      const oomPeaks = oomResult.attempts.map(({ peak_commit_bytes }) => peak_commit_bytes).filter((value): value is number => value !== null);
+      const oomHash = createHash("sha256").update(oomResult.cmd, "utf8").digest("hex");
+      expect(getGateStats(store!, "sample", oomHash).peakCommitMaxBytes).toBe(Math.max(...oomPeaks));
       const lines = readFileSync(markerPath, "utf8").trim().split(/\r?\n/);
       const peerEnd = Number(lines.find((line) => line.startsWith("end:peer:"))!.split(":")[2]);
       const oomRetryStart = Number(oomStarts[1]!.split(":")[2]);
@@ -206,5 +236,19 @@ describe("memory-limited gate launcher", () => {
     } else {
       expect(result.find(({ cmd }) => cmd.includes("peer"))?.peak_commit_bytes).toBeNull();
     }
+  }, { timeout: 30_000 });
+
+  test("keeps both attempt rows when an exclusive OOM retry passes", async () => {
+    setSetting(store!, "memory_limit_gb", 512 * BYTES_PER_MB / GIB);
+    writeTaskGates([{ cmd: command("oom-once", "recover"), ram_est_gb: 400 * BYTES_PER_MB / GIB }]);
+    const cli = runGateCli(false);
+    expect(cli.status).toBe(0);
+    expect(cli.stdout).toContain("oom (512 MB lease) → retried exclusively → pass");
+    const rows = listGateRunsForTask(store!, "GATE-1");
+    expect(rows).toHaveLength(2);
+    expect(rows.map(({ attempt, retryOf, status }) => ({ attempt, retryOf, status }))).toEqual([
+      { attempt: 1, retryOf: null, status: "oom" },
+      { attempt: 2, retryOf: rows[0]!.id, status: "pass" },
+    ]);
   }, { timeout: 30_000 });
 });

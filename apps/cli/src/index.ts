@@ -310,7 +310,15 @@ async function dispatch(store: BoardStore, positionals: string[], options: CliOp
       process.stderr.write(`Gate queued (${cmd}): waiting for memory lease; ${reason}.\n`);
     });
     const failed = gates.some((gate) => gate.status === "fail" || gate.status === "oom");
-    const human = gates.map((gate) => `${gate.cmd}: ${gate.status} (exit ${gate.exit_code ?? "?"}, peak ${gate.peak_commit_bytes === null ? "unknown" : `${(gate.peak_commit_bytes / (1024 * 1024)).toFixed(0)} MB`}, ${gate.log_path})`).join("\n") || "No gates configured.";
+    const human = gates.map((gate) => {
+      const peak = gate.peak_commit_bytes === null ? "unknown" : `${(gate.peak_commit_bytes / (1024 * 1024)).toFixed(0)} MB`;
+      if (gate.attempts.length > 1) {
+        const first = gate.attempts[0]!;
+        const firstLease = first.lease_bytes === null ? "unknown" : `${(first.lease_bytes / (1024 * 1024)).toFixed(0)} MB`;
+        return `${gate.cmd}: ${first.status} (${firstLease} lease) → retried exclusively → ${gate.status} (exit ${gate.exit_code ?? "?"}, peak ${peak}, ${gate.log_path})`;
+      }
+      return `${gate.cmd}: ${gate.status} (exit ${gate.exit_code ?? "?"}, peak ${peak}, ${gate.log_path})`;
+    }).join("\n") || "No gates configured.";
     emit(gates, options.json, human);
     return failed ? 2 : 0;
   }
