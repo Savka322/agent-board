@@ -1,4 +1,5 @@
 # agent-board
+<img width="960" height="540" alt="agent-board-demo" src="https://github.com/user-attachments/assets/9414da4d-2c9c-423a-b7d1-c866f1dc81f5" />
 
 [Русский](README.ru.md)
 
