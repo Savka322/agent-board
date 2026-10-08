@@ -124,7 +124,7 @@ const allCommandUsage = [
   "Usage: agentctl start <task-id> [--fresh] [--note <file>]",
   "Usage: agentctl resume <task-id> --note <file>",
   "Usage: agentctl stop|review|accept|reject <task-id> [--allow-extra <reason>]",
-  "Usage: agentctl ask <task-id> --kind stop|assume --decision <key> --text <text> --recommend <text> [--option <text>...]",
+  "Usage: agentctl ask <task-id> --kind stop|assume --decision <key> --text <text> --option <text> --option <text> [--option <text>...] --recommend <text>",
   "Usage: agentctl answer <question-id> <text> [--reject]",
   "Usage: agentctl questions [--open] [--target owner|claude] [--json]",
   "Usage: agentctl status [--epic <id>] [--json]",
@@ -396,7 +396,8 @@ async function dispatch(store: BoardStore, positionals: string[], options: CliOp
   }
   if (command === "accept") {
     const result = acceptTask(store, required(subcommand, "task id"), { allowExtraReason: options.allowExtra });
-    emit(result, options.json, `Accepted ${result.task} and merged commit ${result.commit.slice(0, 12)} into ${result.merged_into}.`);
+    const recorded = result.decisions.length > 0 ? `\nRecorded assumed decisions: ${result.decisions.map(({ key }) => key).join(", ")}.` : "";
+    emit(result, options.json, `Accepted ${result.task} and merged commit ${result.commit.slice(0, 12)} into ${result.merged_into}.${recorded}`);
     return;
   }
   if (command === "reject") {
@@ -411,6 +412,7 @@ async function dispatch(store: BoardStore, positionals: string[], options: CliOp
     if (kind !== "stop" && kind !== "assume") throw new TypeError("--kind must be stop or assume");
     const text = required(options.text, "--text <text>");
     const recommendation = required(options.recommend, "--recommend <text>");
+    if ((options.option ?? []).length < 2) throw new CliRefusal("The owner chooses between options: pass at least two --option values");
     TaskCardSchema.shape.decisions.parse([decisionKey]);
     ExecutorQuestionSchema.parse({ decision_key: decisionKey, text, options: options.option ?? [], recommendation });
     if (getTask(store, taskId).status !== "review") throw new CliRefusal(`Task ${taskId} must be in review before asking the owner`);

@@ -144,6 +144,8 @@ button:focus-visible, select:focus-visible, a:focus-visible, summary:focus-visib
 .question-highlighted { border-color: var(--blue); box-shadow: 0 0 0 2px color-mix(in srgb, var(--blue) 18%, transparent); }
 .question-code { color: var(--blue); font: 650 10px/1 "Cascadia Code", Consolas, monospace; }
 .question-marker { color: var(--muted); font-size: 9px; }
+.question-task { color: var(--muted); font-size: 9px; line-height: 1.35; overflow-wrap: anywhere; }
+.question-task code { color: var(--ink-soft); font: 600 9px/1 "Cascadia Code", Consolas, monospace; }
 .question-card-text { color: var(--ink); font-size: 10px; line-height: 1.35; overflow-wrap: anywhere; }
 .question-options { color: var(--ink-soft); font-size: 9px; line-height: 1.35; overflow-wrap: anywhere; }
 .question-options b { color: var(--muted); font-weight: 600; }
