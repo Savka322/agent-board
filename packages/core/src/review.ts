@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { ExecutorReportSchema, type ExecutorReport } from "@agent-board/contracts";
-import { getEpic, getProject, getTask, getRun, listRecentEvents, listRunsForTask, transitionTask, type BoardStore } from "./store";
+import { getEpic, getProject, getTask, getRun, listRecentEvents, listRunsForTask, recordAcceptedAssumptions, transitionTask, type BoardStore } from "./store";
 import { changedFiles, getEpicWorktreePath, getTaskWorktreePath, gitOutput, removeTaskWorktree } from "./worktrees";
 
 export class AcceptanceRefusedError extends Error {
@@ -105,8 +105,12 @@ export function acceptTask(store: BoardStore, taskId: string, options: AcceptOpt
 
   const note = options.allowExtraReason?.trim();
   transitionTask(store, taskId, "accept", "claude", 5, note);
+  // Accepting the result accepts the assumptions of the run it came from.
+  const lastRun = listRunsForTask(store, taskId).at(-1);
+  const report = lastRun ? reportForPath(getRun(store, lastRun.id).reportPath) : null;
+  const decisions = recordAcceptedAssumptions(store, epic.project, report?.assumptions ?? []);
   removeTaskWorktree(store, taskId);
-  return { task: taskId, commit: commitId, merged_into: epic.branch, removed_worktree: true };
+  return { task: taskId, commit: commitId, merged_into: epic.branch, removed_worktree: true, decisions };
 }
 
 export function rejectTask(store: BoardStore, taskId: string) {

@@ -72,7 +72,7 @@ Keep the returned `cursor` and pass it back next time; then no event is lost. Ex
 |---|---|
 | `ready` | Re-read the card against newly answered decisions; fix the card file if needed. Then `agentctl start <ID>`. Exit 2 = refused: read the reasons (`deps_pending`, `waiting_answer`, `no_slot`, `file_overlap`, `no_memory`, `paused`, `max_rounds`) |
 | `review` | Review (section 3). The payload carries the run outcome: `done`, `partial`, `blocked`, `failed`, `canceled`, `rate_limited` |
-| `answer` | The owner answered. Check the answer does not contradict other cards, then `agentctl start <ID>` continues the executor's session; `--fresh` starts over |
+| `answer` | The owner answered. `stop` question: check the answer does not contradict other cards, then `agentctl start <ID>` continues the executor's session; `--fresh` starts over. `assume` question: if the owner picked something other than what the executor did — task still in `review` → resume with it, already `done` → cut a follow-up task |
 | `assumption_rejected` | Task still in `review` → resume with the correction. Already `done` → cut a follow-up task |
 | `stale` | `agentctl log <ID>`. Really stuck → `agentctl stop <ID>`, then resume with a note |
 | `failed` | Read `runs/<ID>/<round>/stderr.log`. Infrastructure → resume. Card problem → `reject`, fix the card, start again |
@@ -88,7 +88,7 @@ agentctl gate <ID>                  # card/profile gates under the memory budget
 ```
 
 Checklist: [references/review-checklist.md](references/review-checklist.md). Then exactly one of:
-- `agentctl accept <ID>` — commits the executor's changes and merges `--no-ff` into the epic branch. If files outside `allowed_files` are justified: `--allow-extra "<reason>"`. A merge conflict → exit 2: merge the epic branch into the task worktree, resolve, commit, accept again.
+- `agentctl accept <ID>` — commits the executor's changes and merges `--no-ff` into the epic branch. It also writes the last run's assumptions that carry a decision key into the decisions log, so later cards get them; keys already answered keep their answer. If files outside `allowed_files` are justified: `--allow-extra "<reason>"`. A merge conflict → exit 2: merge the epic branch into the task worktree, resolve, commit, accept again.
 - `agentctl resume <ID> --note <file>` — a precise review note (`<home>/cards/<project>/<ID>-review-<n>.md`): numbered points, each with the problem, the evidence and the expected fix.
 - `agentctl reject <ID>` — the card was wrong; fix the card, then `promote` and `start` again.
 
@@ -105,7 +105,9 @@ An executor that cannot continue ends its run `BLOCKED` with a question addresse
   The task moves to "Needs your answer". The owner answers on the board (or in Telegram, if configured) and you get an `answer` event.
 - **The card itself is wrong** → `agentctl reject <ID>` and re-cut it.
 
-Assumptions in executor reports become non-blocking `assume` questions for the owner automatically; you only act on `assumption_rejected`.
+The owner's column is for choices, not confirmations: `ask` refuses fewer than two `--option`. Never ask the owner to confirm what you can check yourself.
+
+Assumptions in executor reports never reach the owner by themselves. You check every one in review (checklist item 7): wrong → resume; fine → `accept`; a choice only the owner can make → `ask --kind assume` with options.
 
 ## 5. Close the epic
 

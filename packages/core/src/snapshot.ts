@@ -95,7 +95,8 @@ export function boardSnapshot(store: BoardStore, options: BoardSnapshotOptions =
   });
   const ownerQuestions = listQuestions(store, { open: true, target: "owner" });
   const questions = ownerQuestions.flatMap((question) => {
-    const questionEpic = getTask(store, question.task).epic;
+    const questionTask = getTask(store, question.task);
+    const questionEpic = questionTask.epic;
     const questionProject = epicById.get(questionEpic)?.project;
     const heldTaskIds = tasks.filter((task) => epicById.get(task.epic)?.project === questionProject
       && question.decision_key !== null
@@ -104,6 +105,7 @@ export function boardSnapshot(store: BoardStore, options: BoardSnapshotOptions =
     return [{
       id: question.id,
       task: question.task,
+      task_title: questionTask.title,
       decision_key: question.decision_key,
       kind: question.kind,
       text: question.text,

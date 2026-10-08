@@ -11,6 +11,7 @@ import {
   RunOutcomeSchema,
   TaskCardSchema,
   TaskStatusSchema,
+  type ExecutorAssumption,
   type ExecutorQuestion,
   type BoardEventKind,
   type GateStatus,
@@ -520,6 +521,30 @@ export function answerDecision(store: BoardStore, project: string, key: string, 
   const answeredAt = now();
   store.db.update(decisions).set({ status: "answered", answer, answeredAt }).where(and(eq(decisions.project, project), eq(decisions.key, key))).run();
   return { ...current, status: "answered", answer, answeredAt };
+}
+
+/** Settle decision keys that an accepted task's executor assumed; keys already answered keep their answer. */
+export function recordAcceptedAssumptions(store: BoardStore, project: string, assumptions: ExecutorAssumption[]) {
+  const answers = new Map<string, string[]>();
+  for (const { decision_key: key, text } of assumptions) {
+    if (key !== null) answers.set(key, [...(answers.get(key) ?? []), text]);
+  }
+  const answeredAt = now();
+  const recorded: Array<{ key: string; answer: string }> = [];
+  store.db.transaction((tx) => {
+    for (const [key, texts] of answers) {
+      const current = tx.select().from(decisions).where(and(eq(decisions.project, project), eq(decisions.key, key))).get();
+      if (current?.status === "answered") continue;
+      const answer = texts.join("\n");
+      if (current) {
+        tx.update(decisions).set({ status: "answered", answer, answeredAt }).where(and(eq(decisions.project, project), eq(decisions.key, key))).run();
+      } else {
+        tx.insert(decisions).values({ project, key, title: key, status: "answered", answer, answeredAt }).run();
+      }
+      recorded.push({ key, answer });
+    }
+  });
+  return recorded;
 }
 
 export function listOpenDecisions(store: BoardStore, project: string) {

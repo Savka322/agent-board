@@ -426,18 +426,7 @@ async function runExecutor(store: ReturnType<typeof openStore>, runId: string, r
         recommendation: report.question.recommendation,
       });
     }
-    for (const [index, assumption] of (report?.assumptions ?? []).entries()) {
-      createQuestion(store, {
-        id: `assumption-${run.id}-${index + 1}`,
-        task: task.id,
-        kind: "assume",
-        target: "owner",
-        decision_key: assumption.decision_key,
-        text: assumption.text,
-        options: [],
-        recommendation: "Confirm or reject this assumption.",
-      });
-    }
+    // Report assumptions are the orchestrator's to check during review; they never reach the owner by themselves.
   } finally {
     transitionTask(store, task.id, "run_finished", "runner");
   }

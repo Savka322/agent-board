@@ -4,7 +4,9 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
+  answerDecision,
   closeStore,
+  createDecision,
   getEpic,
   getRun,
   getTask,
@@ -403,7 +405,8 @@ describe("runner, worktrees, review, and agentctl", () => {
     await waitForRun(first.run_id);
     const asked = cliJson<{ question: { id: string } }>([
       "ask", "AB-1", "--decision", "implementation", "--kind", "stop",
-      "--text", "Which implementation should be used?", "--recommend", "Option A",
+      "--text", "Which implementation should be used?", "--option", "Option A", "--option", "Option B",
+      "--recommend", "Option A",
     ]);
     cliJson(["answer", asked.question.id, "Choose Option B"]);
 
@@ -452,7 +455,8 @@ describe("runner, worktrees, review, and agentctl", () => {
       await waitForRun(started.run_id);
       const asked = cliJson<{ question: { id: string } }>([
         "ask", "AB-1", "--decision", "implementation", "--kind", "stop",
-        "--text", `Confirm implementation for run ${round}?`, "--recommend", "Continue",
+        "--text", `Confirm implementation for run ${round}?`, "--option", "Continue", "--option", "Stop",
+        "--recommend", "Continue",
       ]);
       cliJson(["answer", asked.question.id, `Continue after run ${round}`]);
     }
@@ -464,33 +468,64 @@ describe("runner, worktrees, review, and agentctl", () => {
     expect(listRunsForTask(store!, "AB-1")).toHaveLength(3);
   });
 
-  test("stores report assumptions as open non-blocking owner questions and records rejection", async () => {
+  test("keeps report assumptions off the owner's board and records their decisions on accept", async () => {
     cliSetup();
     cliJson(["task", "promote", "AB-1"]);
-    process.env.AGENT_BOARD_FAKE_EDIT = "nothing";
+    createDecision(store!, { project: "sample", key: "settled_choice", title: "settled_choice" });
+    answerDecision(store!, "sample", "settled_choice", "The owner's answer");
+    process.env.AGENT_BOARD_FAKE_EDIT = "src/allowed.txt";
     process.env.AGENT_BOARD_FAKE_ASSUMPTIONS = JSON.stringify([
       { decision_key: "api_shape", text: "The API follows the existing client convention." },
       { decision_key: null, text: "The generated file remains checked in." },
+      { decision_key: "api_shape", text: "Errors use the existing envelope." },
+      { decision_key: "settled_choice", text: "The executor's own guess." },
     ]);
     const started = cliJson<{ run_id: string }>(["start", "AB-1"]);
     await waitForRun(started.run_id);
-    const assumptions = listQuestions(store!, { open: true, target: "owner" });
-    expect(assumptions).toHaveLength(2);
-    expect(assumptions.map(({ kind, text }) => ({ kind, text }))).toEqual([
-      { kind: "assume", text: "The API follows the existing client convention." },
-      { kind: "assume", text: "The generated file remains checked in." },
-    ]);
+    expect(listQuestions(store!, { target: "owner" })).toEqual([]);
     expect(getTask(store!, "AB-1").status).toBe("review");
     expect(listBoardEventsAfter(store!, 0, ["review"]).filter((event) => event.run === started.run_id).map((event) => event.payload)).toEqual(["done"]);
 
+    const accepted = cliJson<{ decisions: Array<{ key: string; answer: string }> }>(["accept", "AB-1"]);
+    const apiShape = "The API follows the existing client convention.\nErrors use the existing envelope.";
+    expect(accepted.decisions).toEqual([{ key: "api_shape", answer: apiShape }]);
+    expect(store!.sqlite.query("SELECT key, status, answer FROM decisions ORDER BY key").all()).toEqual([
+      { key: "api_shape", status: "answered", answer: apiShape },
+      { key: "settled_choice", status: "answered", answer: "The owner's answer" },
+    ]);
+  });
+
+  test("asks the owner only with options and records a rejected assumption question", async () => {
+    cliSetup();
+    cliJson(["task", "promote", "AB-1"]);
+    process.env.AGENT_BOARD_FAKE_EDIT = "nothing";
+    const started = cliJson<{ run_id: string }>(["start", "AB-1"]);
+    await waitForRun(started.run_id);
+
+    const refused = cli([
+      "ask", "AB-1", "--decision", "api_shape", "--kind", "assume",
+      "--text", "Which API convention should be used?", "--option", "Existing client", "--recommend", "Existing client", "--json",
+    ]);
+    expect(refused.status).toBe(2);
+    expect(JSON.parse(refused.stdout).error).toContain("at least two --option");
+    expect(listQuestions(store!, { target: "owner" })).toEqual([]);
+
+    const asked = cliJson<{ question: { id: string; kind: string; options: string[] }; task: { status: string } }>([
+      "ask", "AB-1", "--decision", "api_shape", "--kind", "assume",
+      "--text", "Which API convention should be used?", "--option", "Existing client", "--option", "New client",
+      "--recommend", "Existing client",
+    ]);
+    expect(asked.question).toMatchObject({ kind: "assume", options: ["Existing client", "New client"] });
+    expect(asked.task.status).toBe("review");
+
     const rejected = cliJson<{ question: { status: string }; task: { status: string } }>([
-      "answer", assumptions[0]!.id, "Use the other convention", "--reject",
+      "answer", asked.question.id, "New client", "--reject",
     ]);
     expect(rejected.question.status).toBe("rejected");
     expect(rejected.task.status).toBe("review");
     expect(listBoardEventsAfter(store!, 0, ["answer", "assumption_rejected"]).map(({ kind, question }) => ({ kind, question }))).toEqual([
-      { kind: "answer", question: assumptions[0]!.id },
-      { kind: "assumption_rejected", question: assumptions[0]!.id },
+      { kind: "answer", question: asked.question.id },
+      { kind: "assumption_rejected", question: asked.question.id },
     ]);
   });
 

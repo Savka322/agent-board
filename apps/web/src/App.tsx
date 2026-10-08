@@ -429,7 +429,7 @@ function QuestionCard({ question, code, token, highlighted, onOpen, onAnswered }
   const [choice, setChoice] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const submit = async (reject: boolean) => {
+  const submit = async () => {
     const text = (choice || answer).trim();
     if (!text) {
       setError(t("answerRequired"));
@@ -442,7 +442,7 @@ function QuestionCard({ question, code, token, highlighted, onOpen, onAnswered }
     setBusy(true);
     setError("");
     try {
-      await postJson(`/api/questions/${encodeURIComponent(question.id)}/answer`, token, { text, ...(reject ? { reject: true } : {}) });
+      await postJson(`/api/questions/${encodeURIComponent(question.id)}/answer`, token, { text });
       onAnswered();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -452,8 +452,9 @@ function QuestionCard({ question, code, token, highlighted, onOpen, onAnswered }
   };
   return <article className={`question-card${highlighted ? " question-highlighted" : ""}`} aria-label={`${code} ${question.text}`}>
     <div className="question-card-top"><span className="question-code">{code}</span><span className="question-marker">{t("question")}</span></div>
+    <p className="question-task"><code>{question.task}</code> {question.task_title}</p>
     <p className="question-card-text">{question.text}</p>
-    <span className="holds-tag">{t("holds", { count: question.held_task_ids.length })}</span>
+    <span className="holds-tag">{question.kind === "stop" ? t("holds", { count: question.held_task_ids.length }) : t("nonBlocking")}</span>
     {question.options.length > 0 && <fieldset className="answer-options"><legend>{t("options")}</legend>
       {question.options.map((option) => <label className="answer-option" key={option}>
         <input type="radio" name={`answer-${question.id}`} value={option} checked={choice === option} onChange={() => { setChoice(option); setError(""); }} />
@@ -461,14 +462,12 @@ function QuestionCard({ question, code, token, highlighted, onOpen, onAnswered }
       </label>)}
     </fieldset>}
     {question.recommendation && <p className="question-recommendation">{t("recommendation")}: {question.recommendation}</p>}
-    <label className="answer-input-label">{t("yourAnswer")}
+    <label className="answer-input-label">{t(question.options.length > 0 ? "ownAnswer" : "yourAnswer")}
       <textarea value={answer} onChange={(event) => { setAnswer(event.target.value); setChoice(""); setError(""); }} rows={2} />
     </label>
     {error && <p className="inline-error answer-error" role="alert">{error}</p>}
     <div className="answer-actions">
-      {question.kind === "assume"
-        ? <><button className="primary-button" type="button" disabled={busy} onClick={() => void submit(false)}>{t("confirmAnswer")}</button><button className="secondary-button" type="button" disabled={busy} onClick={() => void submit(true)}>{t("rejectAnswer")}</button></>
-        : <button className="primary-button" type="button" disabled={busy} onClick={() => void submit(false)}>{t("sendAnswer")}</button>}
+      <button className="primary-button" type="button" disabled={busy} onClick={() => void submit()}>{t("sendAnswer")}</button>
       {onOpen && <button className="text-button" type="button" onClick={onOpen}>{t("openDetails")}</button>}
     </div>
   </article>;
@@ -531,7 +530,7 @@ export function App() {
   }, [board?.epics]);
   const startableCount = board?.tasks.filter((task) => task.status === "next" && task.labels.length === 0).length ?? 0;
   const questionCards = board?.questions ?? [];
-  const isWaitingForOwner = questionCards.length > 0 && board?.running_count === 0;
+  const isWaitingForOwner = questionCards.some((question) => question.kind === "stop") && board?.running_count === 0;
   const pauseUntil = board?.settings.paused_until ?? null;
   const currentEpic = board?.epics.find((item) => item.id === epic);
   const isPaused = pauseUntil !== null && Date.parse(pauseUntil) > Date.now();

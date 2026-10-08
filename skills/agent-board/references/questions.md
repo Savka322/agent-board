@@ -7,13 +7,14 @@ A `BLOCKED` run creates a question with `target: "claude"`. Decide who answers i
 | How to implement something the card already decides | You | `agentctl answer <QID> "<answer>"`, then `agentctl resume <ID> --note <file>` |
 | A missing detail you can settle from the code (naming, file layout, an edge case with an obvious answer) | You | Same. If other cards depend on the same choice, also add a decision key to them |
 | Behavior the owner would notice: product semantics, money, risk, security, data loss, anything irreversible | Owner | `agentctl ask <ID> --kind stop --decision <key> --text … --option … --recommend …` |
-| A choice the executor can make now and revisit later cheaply | Owner, non-blocking | `agentctl ask <ID> --kind assume …` — the work continues on the default |
+| A product choice the executor can make now and revisit later cheaply | Owner, non-blocking | `agentctl ask <ID> --kind assume …` with options — the work continues on your recommendation |
 | The card is wrong or impossible | You | `agentctl reject <ID>`, re-cut the card |
 
 ## Writing a question for the owner
 
+- The owner picks, they do not confirm. Never send "confirm or reject"; if you can check it yourself, check it.
 - One or two sentences of substance. No jargon the owner has not used.
-- Options with their consequences, as short as possible.
+- At least two options (`ask` refuses fewer), each with its consequence, as short as possible. The owner can also type their own answer.
 - Your recommendation **and why**.
 - The decision key, so the board knows which tasks it holds. The owner sees "holds N tasks"; questions that hold more come first.
 

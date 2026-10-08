@@ -23,6 +23,7 @@ export interface TaskSummary {
 export interface OwnerQuestion {
   id: string;
   task: string;
+  task_title: string;
   decision_key: string | null;
   kind: "stop" | "assume";
   text: string;

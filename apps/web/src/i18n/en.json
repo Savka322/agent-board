@@ -148,9 +148,9 @@
   "writeUnavailable": "Writing is currently unavailable.",
   "recommended": "Recommended",
   "yourAnswer": "Your own answer",
-  "confirmAnswer": "Confirm",
-  "rejectAnswer": "Reject",
-  "sendAnswer": "Send answer",
+  "ownAnswer": "Or your own answer (optional)",
+  "nonBlocking": "doesn't block work",
+  "sendAnswer": "Answer",
   "openDetails": "Open details",
   "approveMerge": "Approve merge",
   "approvedWaiting": "Approved, waiting for Claude to merge"
